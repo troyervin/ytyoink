@@ -1,10 +1,17 @@
+# Source — not distributed via GitHub
+*.py
+*.ico
+*.png
+*.md
+*.spec
+*.json
+*.log
+
+# Build artifacts
 __pycache__/
-*.pyc
 build/
 dist/
-*.spec
-crash.log
-ytdl_config.json
 backups/
 backup/
 Old/
+.claude/
