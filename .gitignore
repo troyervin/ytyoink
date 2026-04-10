@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+crash.log
+ytdl_config.json
+backups/
+backup/
+Old/
