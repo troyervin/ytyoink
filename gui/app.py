@@ -523,12 +523,13 @@ class YTYoinkApp(tk.Tk):
             command=self._on_open_after_change,
         ).pack(side="right")
 
-        # ---- Last Download ----
+        # ---- Last Download (clickable — reveals file in Explorer) ----
         self._last_dl_label = tk.Label(
             frame, text="", font=FONT_SMALL,
-            bg=BG_MAIN, fg=FG_DIM, anchor="w",
+            bg=BG_MAIN, fg=FG_DIM, anchor="w", cursor="hand2",
         )
         self._last_dl_label.pack(fill="x", padx=PAD_SECTION + 2, pady=(2, 0))
+        self._last_dl_label.bind("<Button-1>", self._on_last_dl_click)
 
         # ---- Progress Bar ----
         self._progress_var = tk.DoubleVar(value=0)
@@ -1030,6 +1031,10 @@ class YTYoinkApp(tk.Tk):
         else:
             self._status_bar.append("Download folder not set or does not exist.", "warning")
 
+    def _on_last_dl_click(self, event=None):
+        if self._last_download_path and os.path.isfile(self._last_download_path):
+            subprocess.run(["explorer", "/select,", self._last_download_path])
+
     def _on_open_after_change(self):
         self.config.open_after_download = self._open_after_var.get()
         self.config.save()
@@ -1099,7 +1104,12 @@ class YTYoinkApp(tk.Tk):
     def _on_download_complete(self, result):
         self._last_download = result.filename
         self._last_download_path = result.output_path
-        self._last_dl_label.config(text=f"Last download: {result.filename}")
+        self._last_dl_label.config(
+            text=f"Last download: {result.filename}",
+            fg=FG_ACCENT,
+        )
+        self._last_dl_label.bind("<Enter>", lambda e: self._last_dl_label.config(fg=FG_TEXT))
+        self._last_dl_label.bind("<Leave>", lambda e: self._last_dl_label.config(fg=FG_ACCENT))
         self._status_bar.append(f"Saved: {result.filename}", "success")
         self._progress_var.set(100)
         self._set_ui_state("ready")
