@@ -8,7 +8,6 @@ import tkinter as tk
 from tkinter import filedialog, ttk
 
 from config import AppConfig
-from version import APP_VERSION
 from downloader import CancelledError, DownloadPipeline, VideoInfo
 from itunes import ItunesMatch, search_itunes
 from metadata import clean_title, parse_filename
@@ -72,7 +71,7 @@ class YTYoinkApp(tk.Tk):
         self.after(50, self._enforce_min_height)
 
     def _build_window(self):
-        self.title(f"YTYoink v{APP_VERSION} - SERG Edition")
+        self.title("YTYoink - SERG Edition")
         self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         self.configure(bg=BG_MAIN)
