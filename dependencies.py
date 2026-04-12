@@ -833,7 +833,9 @@ def update_self(github_repo: str, current_version: str, status_callback=None) ->
             return (0,)
 
     if _ver(latest) <= _ver(current_version):
-        return False  # Already up to date — no noise
+        if status_callback:
+            status_callback(f"YTYoink v{current_version} — up to date.")
+        return False
 
     if status_callback:
         status_callback(f"YTYoink {latest} available — downloading update...")
@@ -879,6 +881,7 @@ def update_self(github_repo: str, current_version: str, status_callback=None) ->
         pass  # non-fatal
 
     # Step 5: write replacement batch — clean up new_exe on failure
+    old_pid = os.getpid()
     bat_path = os.path.join(tempfile.gettempdir(), "_ytyoink_update.bat")
     try:
         bat = (
@@ -887,7 +890,9 @@ def update_self(github_repo: str, current_version: str, status_callback=None) ->
             "echo.\r\n"
             "echo  YTYoink Update\r\n"
             "echo  Waiting for app to close...\r\n"
-            "timeout /t 6 /nobreak >nul\r\n"
+            "timeout /t 3 /nobreak >nul\r\n"
+            f"taskkill /f /pid {old_pid} >nul 2>&1\r\n"
+            "timeout /t 3 /nobreak >nul\r\n"
             f'if not exist "{new_exe}" (\r\n'
             "    echo  Update file missing - skipped.\r\n"
             "    timeout /t 3 /nobreak >nul\r\n"
@@ -902,7 +907,7 @@ def update_self(github_repo: str, current_version: str, status_callback=None) ->
             "    goto :end\r\n"
             ")\r\n"
             "echo  Done! Restarting YTYoink...\r\n"
-            "timeout /t 2 /nobreak >nul\r\n"
+            "timeout /t 1 /nobreak >nul\r\n"
             f'powershell -WindowStyle Hidden -Command "Start-Process \'{current_exe}\'"\r\n'
             ":end\r\n"
             'del "%~f0"\r\n'
