@@ -541,7 +541,7 @@ class YTYoinkApp(tk.Tk):
 
         # ---- Status Area ----
         self._status_bar = StatusBar(frame, height=7)
-        self._status_bar.pack(fill="x", padx=PAD_SECTION, pady=(3, 6))
+        self._status_bar.pack(fill="both", expand=True, padx=PAD_SECTION, pady=(3, 6))
 
         # "SERG EDITION" badge at very bottom
         tk.Label(
@@ -559,16 +559,22 @@ class YTYoinkApp(tk.Tk):
 
     def _on_canvas_configure(self, event):
         self._canvas.itemconfig(self._canvas_window, width=event.width)
+        # Stretch the frame to fill the canvas when content is shorter than
+        # the window — this gives pack's expand=True on the status bar room to grow.
+        natural_h = self._main_frame.winfo_reqheight()
+        self._canvas.itemconfig(
+            self._canvas_window,
+            height=max(natural_h, event.height),
+        )
         self._update_scrollbar_visibility()
 
     def _update_scrollbar_visibility(self):
-        bbox = self._canvas.bbox("all")
-        if not bbox:
-            return
-        content_height = bbox[3] - bbox[1]
-        canvas_height = self._canvas.winfo_height()
+        # Compare the *natural* content height (not the stretched height) so
+        # the scrollbar appears when the window is too small, not when it's large.
+        natural_h = self._main_frame.winfo_reqheight()
+        canvas_h = self._canvas.winfo_height()
 
-        if content_height > canvas_height:
+        if natural_h > canvas_h:
             if not self._scrollbar_visible:
                 self._scrollbar.pack(side="right", fill="y")
                 self._scrollbar_visible = True
