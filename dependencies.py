@@ -396,8 +396,12 @@ def run_uninstall() -> None:
         set_status("Stopping YTYoink...")
 
         def worker():
-            subprocess.run(["taskkill", "/f", "/im", "YTYoink.exe"],
-                           capture_output=True, creationflags=CREATE_NO_WINDOW)
+            # Exclude our own PID so we don't kill the uninstall process itself
+            subprocess.run(
+                ["taskkill", "/f", "/im", "YTYoink.exe",
+                 "/fi", f"PID ne {os.getpid()}"],
+                capture_output=True, creationflags=CREATE_NO_WINDOW,
+            )
             time.sleep(1)
 
             set_status("Removing shortcuts...")
