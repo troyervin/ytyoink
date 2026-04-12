@@ -571,6 +571,18 @@ class YTYoinkApp(tk.Tk):
         )
         self._update_scrollbar_visibility()
 
+    def _sync_canvas(self):
+        """Re-run full canvas sizing — call after dynamic content is shown/hidden."""
+        self.update_idletasks()
+        natural_h = self._main_frame.winfo_reqheight()
+        canvas_h = self._canvas.winfo_height()
+        canvas_w = self._canvas.winfo_width()
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        if canvas_w > 1:
+            self._canvas.itemconfig(self._canvas_window, width=canvas_w)
+        self._canvas.itemconfig(self._canvas_window, height=max(natural_h, canvas_h))
+        self._update_scrollbar_visibility()
+
     def _update_scrollbar_visibility(self):
         # Compare the *natural* content height (not the stretched height) so
         # the scrollbar appears when the window is too small, not when it's large.
@@ -807,6 +819,7 @@ class YTYoinkApp(tk.Tk):
 
         self._status_bar.append("Video info fetched successfully.", "success")
         self._set_ui_state("ready")
+        self.after(0, self._sync_canvas)
 
     def _on_fetch_error(self, error_msg):
         self._status_bar.append(f"Error: {error_msg}", "error")
