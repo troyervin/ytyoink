@@ -733,24 +733,27 @@ def bootstrap_install() -> None:
                     f'powershell -NonInteractive -Command "{ps_cmd}"\r\n'
                 )
 
-            # ── Build PowerShell Add/Remove Programs registry entry ───────────────
-            ps_register = (
-                f"$d='{install_dir}';"
-                f"$p='HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\YTYoink';"
-                f"New-Item -Path $p -Force | Out-Null;"
-                f"Set-ItemProperty -Path $p -Name DisplayName -Value 'YTYoink';"
-                f"Set-ItemProperty -Path $p -Name UninstallString -Value ('{target_exe} --uninstall');"
-                f"Set-ItemProperty -Path $p -Name DisplayIcon -Value '{target_exe},0';"
-                f"Set-ItemProperty -Path $p -Name Publisher -Value 'YTYoink';"
-                f"Set-ItemProperty -Path $p -Name DisplayVersion -Value '{APP_VERSION}';"
-                f"Set-ItemProperty -Path $p -Name InstallLocation -Value $d;"
-                f"Set-ItemProperty -Path $p -Name NoModify -Value 1 -Type DWord;"
-                f"Set-ItemProperty -Path $p -Name NoRepair -Value 1 -Type DWord"
-            )
-            register_lines = (
-                "echo Registering...\r\n"
-                f'powershell -NonInteractive -Command "{ps_register}"\r\n'
-            )
+            # ── Write Add/Remove Programs registry entry directly from Python ────
+            # (avoids cmd/PowerShell quoting hell for paths with spaces)
+            set_status("Registering...")
+            reg_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\YTYoink"
+            try:
+                key = winreg.CreateKeyEx(
+                    winreg.HKEY_LOCAL_MACHINE, reg_path,
+                    0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY,
+                )
+                winreg.SetValueEx(key, "DisplayName",    0, winreg.REG_SZ,    "YTYoink")
+                winreg.SetValueEx(key, "UninstallString",0, winreg.REG_SZ,    f'"{target_exe}" --uninstall')
+                winreg.SetValueEx(key, "DisplayIcon",    0, winreg.REG_SZ,    f"{target_exe},0")
+                winreg.SetValueEx(key, "Publisher",      0, winreg.REG_SZ,    "YTYoink")
+                winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ,    APP_VERSION)
+                winreg.SetValueEx(key, "InstallLocation",0, winreg.REG_SZ,    install_dir)
+                winreg.SetValueEx(key, "NoModify",       0, winreg.REG_DWORD, 1)
+                winreg.SetValueEx(key, "NoRepair",       0, winreg.REG_DWORD, 1)
+                winreg.CloseKey(key)
+            except Exception as reg_err:
+                set_status(f"Warning: registry write failed ({reg_err})")
+                import time; time.sleep(2)
 
             bat = (
                 "@echo off\r\n"
@@ -765,8 +768,7 @@ def bootstrap_install() -> None:
                 "    goto :end\r\n"
                 ")\r\n"
                 + shortcut_lines
-                + register_lines +
-                "echo Launching YTYoink...\r\n"
+                + "echo Launching YTYoink...\r\n"
                 "timeout /t 1 /nobreak >nul\r\n"
                 f'powershell -WindowStyle Hidden -Command "Start-Process \'{target_exe}\'"\r\n'
                 ":end\r\n"
