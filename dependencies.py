@@ -861,8 +861,24 @@ def update_self(github_repo: str, current_version: str, status_callback=None) ->
     if status_callback:
         status_callback("Update downloaded — restarting...")
 
-    # Step 4: write replacement batch — clean up new_exe on failure
+    # Step 4: update registry with new version + correct UninstallString.
+    # We are already running elevated (requireAdministrator manifest), so
+    # winreg writes to HKLM work without any extra escalation.
     current_exe = sys.executable
+    try:
+        reg_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\YTYoink"
+        key = winreg.CreateKeyEx(
+            winreg.HKEY_LOCAL_MACHINE, reg_path,
+            0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY,
+        )
+        winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, latest)
+        winreg.SetValueEx(key, "UninstallString", 0, winreg.REG_SZ,
+                          f'"{current_exe}" --uninstall')
+        winreg.CloseKey(key)
+    except Exception:
+        pass  # non-fatal
+
+    # Step 5: write replacement batch — clean up new_exe on failure
     bat_path = os.path.join(tempfile.gettempdir(), "_ytyoink_update.bat")
     try:
         bat = (
