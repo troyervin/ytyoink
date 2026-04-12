@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import filedialog, ttk
 
 from config import AppConfig
+from version import APP_VERSION
 from downloader import CancelledError, DownloadPipeline, VideoInfo
 from itunes import ItunesMatch, search_itunes
 from metadata import clean_title, parse_filename
@@ -71,7 +72,7 @@ class YTYoinkApp(tk.Tk):
         self.after(50, self._enforce_min_height)
 
     def _build_window(self):
-        self.title("YTYoink - SERG Edition")
+        self.title(f"YTYoink v{APP_VERSION} - SERG Edition")
         self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         self.configure(bg=BG_MAIN)
@@ -206,6 +207,7 @@ class YTYoinkApp(tk.Tk):
         self._url_entry.bind("<Return>", lambda e: self._on_fetch_info())
         self._url_entry.bind("<<Paste>>", lambda e: self.after(100, self._on_url_paste))
         self._url_entry.bind("<Control-v>", lambda e: self.after(100, self._on_url_paste))
+        self._url_entry.bind("<FocusIn>", self._on_url_focus)
 
         # ---- Video Info Panel (hidden until fetched) ----
         self._info_outer = tk.Frame(frame, bg=BG_MAIN)
@@ -590,6 +592,34 @@ class YTYoinkApp(tk.Tk):
             self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     # ---- Event handlers ----
+
+    def _on_url_focus(self, event=None):
+        self.after(50, self._check_clipboard_for_url)
+
+    def _check_clipboard_for_url(self):
+        try:
+            clip = self.clipboard_get().strip()
+        except Exception:
+            return
+        if not clip or not self._is_youtube_url(clip):
+            return
+        current = self._url_entry.get().strip()
+        if clip == current:
+            return
+        self._url_entry.delete(0, tk.END)
+        self._url_entry.insert(0, clip)
+        self.after(100, self._on_url_paste)
+
+    @staticmethod
+    def _is_youtube_url(url: str) -> bool:
+        try:
+            from urllib.parse import urlparse
+            import re
+            host = (urlparse(url).hostname or "").lower()
+            return bool(re.search(r"(^|\.)youtube\.com$", host) or
+                        re.match(r"^(www\.)?youtu\.be$", host))
+        except Exception:
+            return False
 
     def _on_url_paste(self):
         url = self._url_entry.get().strip()
