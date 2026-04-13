@@ -8,7 +8,7 @@
 
 YTYoink is a Windows desktop app (tkinter GUI, PyInstaller frozen exe) that downloads audio from YouTube, enriches metadata via the iTunes API, embeds cover art, and produces clean M4A/MP3 files ready for a music library. iTunes is the primary source of truth for album, year, and genre.
 
-**Current version:** see `version.py` → `APP_VERSION`
+**Current version:** see `version.py` → `APP_VERSION` (currently `1.1.22`)
 **GitHub repo:** `troyervin/ytyoink` (public, no description, no README — intentionally invisible)
 
 ---
@@ -186,7 +186,11 @@ All network/subprocess work runs on daemon threads. GUI updates **must** go thro
 
 **Metadata source toggle:** Shown only when iTunes match found. User can switch between iTunes and YouTube metadata mid-session. Preference saved to config.
 
-**`keep_overrides` checkbox:** When checked, field overrides survive a new fetch (don't reset on next URL). When unchecked, fields reset to auto-detected values each fetch.
+**`keep_overrides` checkbox:** When checked, field overrides survive a new fetch (don't reset on next URL). When unchecked, only *unchecked* fields reset to auto-detected values — any field the user has explicitly checked is always preserved regardless of this setting.
+
+**Turbo mode:** Checkbox in the button row (right side). When enabled, fetch auto-triggers download immediately after info is retrieved (~50ms delay), using preferred source settings. Saved to config. Tooltip on hover explains behavior. Intended for batch album ripping: pre-set overrides (title, art, etc.) before pasting URLs — checked fields survive each fetch so they apply to every download.
+
+**Artwork panel:** Cover art radio buttons (None / Use YouTube / Use iTunes / Custom) are always visible. Custom art can be loaded pre-fetch via drop, paste, or browse. The thumbnail row (iTunes / YouTube / Custom previews) is hidden pre-fetch and appears after fetch — or immediately when a custom image is loaded. Re-fetching repacks thumbnails in order (iTunes → YouTube → Custom) to keep layout consistent. `_sync_canvas()` is called after any pack/unpack in this section.
 
 ---
 
@@ -201,6 +205,7 @@ Stored beside the exe at `app_dir()`. Created on first run. Backward-compatible 
 | `CoverSource` | `"itunes"` / `"youtube"` / `"none"` | `"itunes"` |
 | `MetadataSource` | `"itunes"` / `"youtube"` | `"itunes"` |
 | `OpenAfterDownload` | bool | `false` |
+| `TurboMode` | bool | `false` |
 
 ---
 
