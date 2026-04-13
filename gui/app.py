@@ -11,7 +11,7 @@ from config import AppConfig
 from downloader import CancelledError, DownloadPipeline, VideoInfo
 from itunes import ItunesMatch, search_itunes
 from metadata import clean_title, parse_filename
-from paths import asset_dir
+from paths import app_dir, asset_dir
 from url_utils import normalize_youtube_url
 
 from gui.styles import (
@@ -71,6 +71,24 @@ class YTYoinkApp(tk.Tk):
         self._set_icon()
         self.after(50, self._enforce_min_height)
 
+    def _read_edition(self) -> str:
+        """Read edition name from edition.key beside the exe. Defaults to TREE."""
+        key_path = os.path.join(app_dir(), "edition.key")
+        if not os.path.isfile(key_path):
+            try:
+                with open(key_path, "w", encoding="utf-8") as f:
+                    f.write("TREE\n")
+            except OSError:
+                pass
+        try:
+            with open(key_path, "r", encoding="utf-8") as f:
+                word = f.read().strip()
+                if word:
+                    return word
+        except OSError:
+            pass
+        return "TREE"
+
     def _enforce_min_height(self):
         """Resize window to exactly fit pre-fetch content — no scrollbar on open."""
         self.update_idletasks()
@@ -80,7 +98,8 @@ class YTYoinkApp(tk.Tk):
         self.minsize(WINDOW_MIN_WIDTH, content_h)
 
     def _build_window(self):
-        self.title("YTYoink - SERG Edition")
+        edition = self._read_edition()
+        self.title(f"YTYoink - {edition} Edition")
         self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         self.configure(bg=BG_MAIN)
