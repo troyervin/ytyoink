@@ -98,8 +98,8 @@ class YTYoinkApp(tk.Tk):
         self.minsize(WINDOW_MIN_WIDTH, content_h)
 
     def _build_window(self):
-        edition = self._read_edition()
-        self.title(f"YTYoink - {edition} Edition")
+        self._edition = self._read_edition()
+        self.title(f"YTYoink - {self._edition} Edition")
         self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         self.configure(bg=BG_MAIN)
@@ -593,7 +593,7 @@ class YTYoinkApp(tk.Tk):
 
         # "SERG EDITION" badge at very bottom
         tk.Label(
-            frame, text=" SERG EDITION ", font=("Cascadia Code", 6),
+            frame, text=f" {self._edition} EDITION ", font=("Cascadia Code", 6),
             bg=BG_MAIN, fg=FG_DIM,
             highlightbackground=BORDER_COLOR, highlightcolor=BORDER_COLOR,
             highlightthickness=1, padx=3, pady=0,
