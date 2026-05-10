@@ -89,6 +89,35 @@ class YTYoinkApp(tk.Tk):
             pass
         return "TREE"
 
+    def _make_fire_photo(self, size: int = 36) -> "ImageTk.PhotoImage | None":
+        """Render 🔥 with a red-top → yellow-bottom gradient via PIL."""
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            pad = 6
+            canvas = size + pad * 2
+            emoji_img = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(emoji_img)
+            try:
+                font = ImageFont.truetype("seguiemj.ttf", size)
+            except OSError:
+                return None
+            draw.text((pad, pad), "🔥", font=font, embedded_color=True)
+            # Build red→yellow gradient over the same canvas
+            gradient = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
+            g_draw = ImageDraw.Draw(gradient)
+            for y in range(canvas):
+                t = y / max(canvas - 1, 1)
+                r, g_val, b = 220, int(t * 220), 0  # red at top → yellow at bottom
+                g_draw.line([(0, y), (canvas, y)], fill=(r, g_val, b, 255))
+            # Mask the gradient with the emoji's alpha channel
+            gradient.putalpha(emoji_img.split()[3])
+            bbox = emoji_img.getbbox()
+            if bbox:
+                gradient = gradient.crop(bbox)
+            return ImageTk.PhotoImage(gradient)
+        except Exception:
+            return None
+
     def _enforce_min_height(self):
         """Resize window to exactly fit pre-fetch content — no scrollbar on open."""
         self.update_idletasks()
@@ -192,10 +221,24 @@ class YTYoinkApp(tk.Tk):
         title_frame = tk.Frame(header_frame, bg=BG_MAIN)
         title_frame.pack(side="left")
 
+        ytyoink_row = tk.Frame(title_frame, bg=BG_MAIN)
+        ytyoink_row.pack(anchor="w")
+
         tk.Label(
-            title_frame, text="YTYoink", font=FONT_HEADING,
+            ytyoink_row, text="YTYoink", font=FONT_HEADING,
             bg=BG_MAIN, fg=FG_ACCENT,
-        ).pack(anchor="w")
+        ).pack(side="left")
+
+        self._fire_photo = self._make_fire_photo(size=20)
+        if self._fire_photo:
+            tk.Label(
+                ytyoink_row, image=self._fire_photo, bg=BG_MAIN, padx=2,
+            ).pack(side="left")
+        else:
+            tk.Label(
+                ytyoink_row, text="🔥", font=("Segoe UI Emoji", 17),
+                bg=BG_MAIN,
+            ).pack(side="left")
 
         tk.Label(
             title_frame, text="YouTube Audio Downloader", font=FONT_SUBHEADING,
