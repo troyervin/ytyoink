@@ -97,9 +97,14 @@ class YTYoinkApp(tk.Tk):
             canvas = size + pad * 2
             emoji_img = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
             draw = ImageDraw.Draw(emoji_img)
-            try:
-                font = ImageFont.truetype("seguiemj.ttf", size)
-            except OSError:
+            font = None
+            for font_path in ("seguiemj.ttf", r"C:\Windows\Fonts\seguiemj.ttf"):
+                try:
+                    font = ImageFont.truetype(font_path, size)
+                    break
+                except OSError:
+                    continue
+            if font is None:
                 return None
             draw.text((pad, pad), "🔥", font=font, embedded_color=True)
             # Build red→yellow gradient over the same canvas
