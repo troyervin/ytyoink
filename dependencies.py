@@ -840,19 +840,20 @@ def update_self(github_repo: str, current_version: str, status_callback=None) ->
     if status_callback:
         status_callback(f"YTYoink {latest} available — downloading update...")
 
-    # Step 3: download new exe — _download_file already handles errors and cleans up
-    exe_url = f"https://github.com/{github_repo}/releases/latest/download/YTYoink.exe"
+    # Step 3: download full zip (includes exe + _internal so libraries stay in sync)
+    zip_url = f"https://github.com/{github_repo}/releases/latest/download/YTYoink_full.zip"
     exe_dir = os.path.dirname(sys.executable)
-    new_exe = os.path.join(exe_dir, "YTYoink_new.exe")
+    zip_path = os.path.join(tempfile.gettempdir(), "_ytyoink_update.zip")
+    extract_dir = os.path.join(tempfile.gettempdir(), "_ytyoink_extract")
 
-    if not _download_file(exe_url, new_exe, status_callback, f"YTYoink {latest}"):
+    if not _download_file(zip_url, zip_path, status_callback, f"YTYoink {latest}"):
         return False
 
-    # Strip the "Mark of the Web" so Defender doesn't treat it as an internet download
+    # Strip the "Mark of the Web"
     try:
         subprocess.run(
             ["powershell", "-NonInteractive", "-Command",
-             f"Unblock-File -Path '{new_exe}'"],
+             f"Unblock-File -Path '{zip_path}'"],
             creationflags=CREATE_NO_WINDOW,
             capture_output=True,
             timeout=10,
@@ -880,9 +881,11 @@ def update_self(github_repo: str, current_version: str, status_callback=None) ->
     except Exception:
         pass  # non-fatal
 
-    # Step 5: write replacement batch — clean up new_exe on failure
+    # Step 5: write replacement batch
     old_pid = os.getpid()
     bat_path = os.path.join(tempfile.gettempdir(), "_ytyoink_update.bat")
+    internal_dir = os.path.join(exe_dir, "_internal")
+    new_exe = os.path.join(exe_dir, "YTYoink_new.exe")
     try:
         bat = (
             "@echo off\r\n"
@@ -893,22 +896,29 @@ def update_self(github_repo: str, current_version: str, status_callback=None) ->
             "timeout /t 3 /nobreak >nul\r\n"
             f"taskkill /f /pid {old_pid} >nul 2>&1\r\n"
             "timeout /t 3 /nobreak >nul\r\n"
-            f'if not exist "{new_exe}" (\r\n'
+            f'if not exist "{zip_path}" (\r\n'
             "    echo  Update file missing - skipped.\r\n"
             "    timeout /t 3 /nobreak >nul\r\n"
             "    goto :end\r\n"
             ")\r\n"
+            "echo  Extracting update...\r\n"
+            f'powershell -NonInteractive -Command "Expand-Archive -Path \'{zip_path}\' -DestinationPath \'{extract_dir}\' -Force" >nul 2>&1\r\n'
+            "echo  Updating libraries...\r\n"
+            f'powershell -NonInteractive -Command "if (Test-Path \'{extract_dir}\\YTYoink\\_internal\') {{ Copy-Item -Path \'{extract_dir}\\YTYoink\\_internal\\*\' -Destination \'{internal_dir}\' -Recurse -Force }}" >nul 2>&1\r\n'
             "echo  Applying update...\r\n"
-            f'move /y "{new_exe}" "{current_exe}" >nul\r\n'
+            f'if exist "{extract_dir}\\YTYoink\\YTYoink.exe" move /y "{extract_dir}\\YTYoink\\YTYoink.exe" "{new_exe}" >nul\r\n'
+            f'if exist "{new_exe}" move /y "{new_exe}" "{current_exe}" >nul\r\n'
             "if errorlevel 1 (\r\n"
             "    echo  Could not apply update - skipped.\r\n"
-            f'    del "{new_exe}" 2>nul\r\n'
             "    timeout /t 3 /nobreak >nul\r\n"
-            "    goto :end\r\n"
+            "    goto :cleanup\r\n"
             ")\r\n"
             "echo  Done! Restarting YTYoink...\r\n"
             "timeout /t 1 /nobreak >nul\r\n"
             f'powershell -WindowStyle Hidden -Command "Start-Process \'{current_exe}\'"\r\n'
+            ":cleanup\r\n"
+            f'del "{zip_path}" 2>nul\r\n'
+            f'powershell -NonInteractive -Command "Remove-Item \'{extract_dir}\' -Recurse -Force -ErrorAction SilentlyContinue" >nul 2>&1\r\n'
             ":end\r\n"
             'del "%~f0"\r\n'
         )
@@ -930,7 +940,7 @@ def update_self(github_repo: str, current_version: str, status_callback=None) ->
         )
     except Exception:
         try:
-            os.remove(new_exe)
+            os.remove(zip_path)
             os.remove(bat_path)
         except OSError:
             pass
