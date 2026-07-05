@@ -13,6 +13,124 @@ import winreg
 CREATE_NO_WINDOW = 0x08000000
 
 
+def _ps_quote(path: str) -> str:
+    """Escape a path for embedding in a single-quoted PowerShell string."""
+    return path.replace("'", "''")
+
+
+def _ps_progress_form(title: str) -> str:
+    """PowerShell prelude: small dark progress window + Step helper.
+
+    Used by the updater/installer scripts so their file operations show a
+    GUI progress window instead of a console. Colors match the app theme.
+    """
+    return (
+        "$ErrorActionPreference = 'SilentlyContinue'\n"
+        "Add-Type -AssemblyName System.Windows.Forms\n"
+        "Add-Type -AssemblyName System.Drawing\n"
+        "$form = New-Object Windows.Forms.Form\n"
+        f"$form.Text = '{_ps_quote(title)}'\n"
+        "$form.ClientSize = New-Object Drawing.Size(340, 84)\n"
+        "$form.StartPosition = 'CenterScreen'\n"
+        "$form.FormBorderStyle = 'FixedDialog'\n"
+        "$form.MaximizeBox = $false\n"
+        "$form.MinimizeBox = $false\n"
+        "$form.ControlBox = $false\n"
+        "$form.TopMost = $true\n"
+        "$form.BackColor = [Drawing.Color]::FromArgb(24, 24, 37)\n"
+        "$label = New-Object Windows.Forms.Label\n"
+        "$label.Text = 'Preparing...'\n"
+        "$label.ForeColor = [Drawing.Color]::FromArgb(205, 214, 244)\n"
+        "$label.Font = New-Object Drawing.Font('Segoe UI', 10)\n"
+        "$label.Location = New-Object Drawing.Point(20, 14)\n"
+        "$label.AutoSize = $true\n"
+        "$form.Controls.Add($label)\n"
+        "$bar = New-Object Windows.Forms.ProgressBar\n"
+        "$bar.Minimum = 0\n"
+        "$bar.Maximum = 100\n"
+        "$bar.Value = 5\n"
+        "$bar.Location = New-Object Drawing.Point(20, 46)\n"
+        "$bar.Size = New-Object Drawing.Size(300, 16)\n"
+        "$form.Controls.Add($bar)\n"
+        "$form.Show()\n"
+        "$form.Refresh()\n"
+        "function Step($t, $p) { $label.Text = $t; $bar.Value = $p; "
+        "$form.Refresh(); [Windows.Forms.Application]::DoEvents() }\n"
+    )
+
+
+def _build_update_script(old_pid, zip_path, extract_dir, internal_dir,
+                         new_exe, current_exe) -> str:
+    """Self-update swap script with GUI progress. Always relaunches the app,
+    update applied or not — the user is never left with a closed app."""
+    q = _ps_quote
+    return (
+        _ps_progress_form("YTYoink Update")
+        + "Step 'Waiting for app to close...' 10\n"
+        "Start-Sleep -Seconds 3\n"
+        f"Stop-Process -Id {old_pid} -Force\n"
+        "Start-Sleep -Seconds 2\n"
+        f"if (Test-Path '{q(zip_path)}') {{\n"
+        "  Step 'Extracting update...' 30\n"
+        f"  Expand-Archive -Path '{q(zip_path)}' -DestinationPath '{q(extract_dir)}' -Force\n"
+        "  Step 'Updating libraries...' 60\n"
+        f"  if (Test-Path '{q(extract_dir)}\\YTYoink\\_internal') "
+        f"{{ Copy-Item -Path '{q(extract_dir)}\\YTYoink\\_internal\\*' "
+        f"-Destination '{q(internal_dir)}' -Recurse -Force }}\n"
+        "  Step 'Applying update...' 85\n"
+        f"  if (Test-Path '{q(extract_dir)}\\YTYoink\\YTYoink.exe') "
+        f"{{ Move-Item -Path '{q(extract_dir)}\\YTYoink\\YTYoink.exe' "
+        f"-Destination '{q(new_exe)}' -Force }}\n"
+        f"  if (Test-Path '{q(new_exe)}') "
+        f"{{ Move-Item -Path '{q(new_exe)}' -Destination '{q(current_exe)}' -Force }}\n"
+        "}\n"
+        "Step 'Restarting YTYoink...' 100\n"
+        f"Start-Process '{q(current_exe)}'\n"
+        f"Remove-Item '{q(zip_path)}' -Force\n"
+        f"Remove-Item '{q(extract_dir)}' -Recurse -Force\n"
+        "$form.Close()\n"
+        "Remove-Item $MyInvocation.MyCommand.Path -Force\n"
+    )
+
+
+def _build_install_script(src, install_dir, target_exe, extract_dir,
+                          zip_path, ps_shortcuts) -> str:
+    """First-install copy script with GUI progress (replaces the setup bat)."""
+    q = _ps_quote
+    shortcut_step = ""
+    if ps_shortcuts:
+        shortcut_step = ("  Step 'Creating shortcuts...' 80\n  "
+                         + "\n  ".join(ps_shortcuts) + "\n")
+    return (
+        _ps_progress_form("YTYoink Setup")
+        + "Step 'Installing YTYoink...' 15\n"
+        "Start-Sleep -Seconds 2\n"
+        f"robocopy '{q(src)}' '{q(install_dir)}' /e /is /it /np /nfl /ndl | Out-Null\n"
+        "if ($LASTEXITCODE -ge 8) {\n"
+        "  Step 'Installation failed. Please try again.' 100\n"
+        "  Start-Sleep -Seconds 5\n"
+        "} else {\n"
+        + shortcut_step +
+        "  Step 'Launching YTYoink...' 100\n"
+        f"  Start-Process '{q(target_exe)}'\n"
+        "}\n"
+        f"Remove-Item '{q(extract_dir)}' -Recurse -Force\n"
+        f"Remove-Item '{q(zip_path)}' -Force\n"
+        "$form.Close()\n"
+        "Remove-Item $MyInvocation.MyCommand.Path -Force\n"
+    )
+
+
+def _launch_hidden_ps1(ps1_path: str) -> None:
+    """Run a PowerShell script with no console window (GUI forms still show)."""
+    subprocess.Popen(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-WindowStyle", "Hidden", "-File", ps1_path],
+        creationflags=CREATE_NO_WINDOW,
+        close_fds=True,
+    )
+
+
 def _refresh_path() -> None:
     """Re-read PATH from the Windows registry so newly installed tools are found."""
     try:
@@ -695,7 +813,7 @@ def bootstrap_install() -> None:
             set_status("Installing...")
 
             src = os.path.join(extract_dir, "YTYoink")
-            bat_path = os.path.join(tempfile.gettempdir(), "_ytyoink_setup.bat")
+            bat_path = os.path.join(tempfile.gettempdir(), "_ytyoink_setup.ps1")
 
             # Paths used by shortcuts
             desktop_lnk = os.path.join(
@@ -729,13 +847,7 @@ def bootstrap_install() -> None:
                     f"$lnk.Save()"
                 )
 
-            shortcut_lines = ""
-            if ps_shortcuts:
-                ps_cmd = "; ".join(ps_shortcuts)
-                shortcut_lines = (
-                    "echo Creating shortcuts...\r\n"
-                    f'powershell -NonInteractive -Command "{ps_cmd}"\r\n'
-                )
+            # (shortcut commands are embedded in the install script below)
 
             # ── Write Add/Remove Programs registry entry directly from Python ────
             # (avoids cmd/PowerShell quoting hell for paths with spaces)
@@ -759,35 +871,14 @@ def bootstrap_install() -> None:
                 set_status(f"Warning: registry write failed ({reg_err})")
                 import time; time.sleep(2)
 
-            bat = (
-                "@echo off\r\n"
-                "title YTYoink Setup\r\n"
-                "echo Installing YTYoink...\r\n"
-                "timeout /t 3 /nobreak >nul\r\n"
-                f'robocopy "{src}" "{install_dir}" /e /is /it /np /nfl /ndl\r\n'
-                "set RC=%errorlevel%\r\n"
-                "if %RC% GEQ 8 (\r\n"
-                "    echo Installation failed. Please try again.\r\n"
-                "    timeout /t 5 /nobreak >nul\r\n"
-                "    goto :end\r\n"
-                ")\r\n"
-                + shortcut_lines
-                + "echo Launching YTYoink...\r\n"
-                "timeout /t 1 /nobreak >nul\r\n"
-                f'powershell -WindowStyle Hidden -Command "Start-Process \'{target_exe}\'"\r\n'
-                ":end\r\n"
-                f'rd /s /q "{extract_dir}" 2>nul\r\n'
-                f'del "{zip_path}" 2>nul\r\n'
-                'del "%~f0"\r\n'
+            script = _build_install_script(
+                src, install_dir, target_exe, extract_dir, zip_path,
+                ps_shortcuts,
             )
-            with open(bat_path, "w") as f:
-                f.write(bat)
+            with open(bat_path, "w", encoding="utf-8-sig") as f:
+                f.write(script)
 
-            subprocess.Popen(
-                ["cmd.exe", "/c", bat_path],
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-                close_fds=True,
-            )
+            _launch_hidden_ps1(bat_path)
             root.after(0, root.destroy)
 
         except Exception as e:
@@ -881,67 +972,32 @@ def update_self(github_repo: str, current_version: str, status_callback=None) ->
     except Exception:
         pass  # non-fatal
 
-    # Step 5: write replacement batch
+    # Step 5: write the swap script — GUI progress window, no console
     old_pid = os.getpid()
-    bat_path = os.path.join(tempfile.gettempdir(), "_ytyoink_update.bat")
+    ps1_path = os.path.join(tempfile.gettempdir(), "_ytyoink_update.ps1")
     internal_dir = os.path.join(exe_dir, "_internal")
     new_exe = os.path.join(exe_dir, "YTYoink_new.exe")
     try:
-        bat = (
-            "@echo off\r\n"
-            "title YTYoink Updater\r\n"
-            "echo.\r\n"
-            "echo  YTYoink Update\r\n"
-            "echo  Waiting for app to close...\r\n"
-            "timeout /t 3 /nobreak >nul\r\n"
-            f"taskkill /f /pid {old_pid} >nul 2>&1\r\n"
-            "timeout /t 3 /nobreak >nul\r\n"
-            f'if not exist "{zip_path}" (\r\n'
-            "    echo  Update file missing - skipped.\r\n"
-            "    timeout /t 3 /nobreak >nul\r\n"
-            "    goto :end\r\n"
-            ")\r\n"
-            "echo  Extracting update...\r\n"
-            f'powershell -NonInteractive -Command "Expand-Archive -Path \'{zip_path}\' -DestinationPath \'{extract_dir}\' -Force" >nul 2>&1\r\n'
-            "echo  Updating libraries...\r\n"
-            f'powershell -NonInteractive -Command "if (Test-Path \'{extract_dir}\\YTYoink\\_internal\') {{ Copy-Item -Path \'{extract_dir}\\YTYoink\\_internal\\*\' -Destination \'{internal_dir}\' -Recurse -Force }}" >nul 2>&1\r\n'
-            "echo  Applying update...\r\n"
-            f'if exist "{extract_dir}\\YTYoink\\YTYoink.exe" move /y "{extract_dir}\\YTYoink\\YTYoink.exe" "{new_exe}" >nul\r\n'
-            f'if exist "{new_exe}" move /y "{new_exe}" "{current_exe}" >nul\r\n'
-            "if errorlevel 1 (\r\n"
-            "    echo  Could not apply update - skipped.\r\n"
-            "    timeout /t 3 /nobreak >nul\r\n"
-            "    goto :cleanup\r\n"
-            ")\r\n"
-            "echo  Done! Restarting YTYoink...\r\n"
-            "timeout /t 1 /nobreak >nul\r\n"
-            f'powershell -WindowStyle Hidden -Command "Start-Process \'{current_exe}\'"\r\n'
-            ":cleanup\r\n"
-            f'del "{zip_path}" 2>nul\r\n'
-            f'powershell -NonInteractive -Command "Remove-Item \'{extract_dir}\' -Recurse -Force -ErrorAction SilentlyContinue" >nul 2>&1\r\n'
-            ":end\r\n"
-            'del "%~f0"\r\n'
+        script = _build_update_script(
+            old_pid, zip_path, extract_dir, internal_dir, new_exe, current_exe,
         )
-        with open(bat_path, "w") as f:
-            f.write(bat)
+        # utf-8-sig: BOM so Windows PowerShell 5 reads the script as UTF-8
+        with open(ps1_path, "w", encoding="utf-8-sig") as f:
+            f.write(script)
     except Exception:
         try:
-            os.remove(new_exe)
+            os.remove(zip_path)
         except OSError:
             pass
         return False
 
-    # Step 5: launch the batch with its own console so the user can see progress
+    # Step 6: launch it hidden — the script shows its own progress window
     try:
-        subprocess.Popen(
-            ["cmd.exe", "/c", bat_path],
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
-            close_fds=True,
-        )
+        _launch_hidden_ps1(ps1_path)
     except Exception:
         try:
             os.remove(zip_path)
-            os.remove(bat_path)
+            os.remove(ps1_path)
         except OSError:
             pass
         return False

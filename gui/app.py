@@ -1290,7 +1290,8 @@ class YTYoinkApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_self_update(self):
-        self._status_bar.append("Restarting to apply update...", "success")
+        self._status_bar.append(
+            "Update ready — YTYoink will close and restart itself...", "success")
         self.after(1500, self.destroy)
 
     def prompt_download_folder(self):
