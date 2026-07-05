@@ -339,7 +339,7 @@ class DownloadPipeline:
 
             if attempt < max_attempts and "403" in "\n".join(output_lines):
                 self._status(
-                    f"YouTube rejected the download (403) — "
+                    f"YouTube rejected the download (403), "
                     f"retrying ({attempt + 1}/{max_attempts})..."
                 )
                 time.sleep(2)

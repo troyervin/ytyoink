@@ -645,7 +645,7 @@ class YTYoinkApp(tk.Tk):
         self._make_tooltip(
             self._keep_overrides_cb,
             "Keeps your checked override fields filled in for the\n"
-            "next fetch — useful when downloading several tracks\n"
+            "next fetch. Useful when downloading several tracks\n"
             "that share the same artist, album, or year.",
         )
 
@@ -908,7 +908,7 @@ class YTYoinkApp(tk.Tk):
             self._status_bar.append("Please enter a valid URL starting with http", "warning")
             return
         if not self._deps_ready:
-            self._status_bar.append("Please wait — checking/installing dependencies...", "warning")
+            self._status_bar.append("Please wait, checking dependencies...", "warning")
             return
 
         normalized = normalize_youtube_url(url)
@@ -1578,7 +1578,7 @@ class YTYoinkApp(tk.Tk):
 
     def _apply_self_update(self):
         self._status_bar.append(
-            "Update ready — YTYoink will close and restart itself...", "success")
+            "Update ready. YTYoink will close and restart itself...", "success")
         self.after(1500, self.destroy)
 
     def prompt_download_folder(self):

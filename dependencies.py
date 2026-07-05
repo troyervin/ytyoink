@@ -925,11 +925,11 @@ def update_self(github_repo: str, current_version: str, status_callback=None) ->
 
     if _ver(latest) <= _ver(current_version):
         if status_callback:
-            status_callback(f"YTYoink v{current_version} — up to date.")
+            status_callback(f"YTYoink v{current_version} is up to date.")
         return False
 
     if status_callback:
-        status_callback(f"YTYoink {latest} available — downloading update...")
+        status_callback(f"YTYoink {latest} available, downloading update...")
 
     # Step 3: download full zip (includes exe + _internal so libraries stay in sync)
     zip_url = f"https://github.com/{github_repo}/releases/latest/download/YTYoink_full.zip"
@@ -953,7 +953,7 @@ def update_self(github_repo: str, current_version: str, status_callback=None) ->
         pass  # non-fatal — update still attempted
 
     if status_callback:
-        status_callback("Update downloaded — restarting...")
+        status_callback("Update downloaded, restarting...")
 
     # Step 4: update registry with new version + correct UninstallString.
     # We are already running elevated (requireAdministrator manifest), so
