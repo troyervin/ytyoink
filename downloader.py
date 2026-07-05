@@ -15,7 +15,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from threading import Event
+from threading import Event, Timer
 from typing import Callable
 
 from config import AppConfig
@@ -296,41 +296,55 @@ class DownloadPipeline:
             url,
         ]
 
-        # Run yt-dlp
-        process = subprocess.Popen(
-            dl_args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            creationflags=CREATE_NO_WINDOW,
-        )
+        # Run yt-dlp. YouTube intermittently 403s the signed media URLs;
+        # a fresh yt-dlp run re-signs them, so retry up to 2 extra times
+        # on 403 before giving up. Everything else fails immediately.
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            process = subprocess.Popen(
+                dl_args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                creationflags=CREATE_NO_WINDOW,
+            )
 
-        output_lines = []
-        try:
-            for line in process.stdout:
-                line = line.rstrip()
-                output_lines.append(line)
+            output_lines = []
+            try:
+                for line in process.stdout:
+                    line = line.rstrip()
+                    output_lines.append(line)
 
-                # Parse progress
-                if "[download]" in line and "%" in line:
-                    m = re.search(r"(\d+\.?\d*)%", line)
-                    if m:
-                        pct = float(m.group(1))
-                        self._progress(pct * 0.5, line)  # 0-50% for download phase
-                else:
-                    self._status(line)
+                    # Parse progress
+                    if "[download]" in line and "%" in line:
+                        m = re.search(r"(\d+\.?\d*)%", line)
+                        if m:
+                            pct = float(m.group(1))
+                            self._progress(pct * 0.5, line)  # 0-50% for download phase
+                    else:
+                        self._status(line)
 
-                if self._cancel.is_set():
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    raise CancelledError("Download cancelled by user")
-        finally:
-            process.wait()
+                    if self._cancel.is_set():
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                        raise CancelledError("Download cancelled by user")
+            finally:
+                process.wait()
 
-        if process.returncode != 0:
+            if process.returncode == 0:
+                break
+
+            if attempt < max_attempts and "403" in "\n".join(output_lines):
+                self._status(
+                    f"YouTube rejected the download (403) — "
+                    f"retrying ({attempt + 1}/{max_attempts})..."
+                )
+                time.sleep(2)
+                continue
+
             raise RuntimeError(
                 f"yt-dlp failed (exit code {process.returncode}). "
                 + "\n".join(output_lines[-5:])
@@ -465,10 +479,12 @@ class DownloadPipeline:
 
         final_path = get_unique_path(self.config.download_folder, base_name, final_ext)
 
-        # Encode with ffmpeg
+        # Encode with ffmpeg — this re-encodes the full track, so for long
+        # videos it is the slowest phase; the status must say so honestly.
         self._check_cancel()
-        self._status("Embedding metadata...")
-        self._progress(80, "Embedding metadata...")
+        fmt_label = final_ext.upper()
+        self._status(f"Encoding to {fmt_label} and embedding metadata...")
+        self._progress(80, f"Encoding to {fmt_label}...")
 
         has_cover = os.path.isfile(png_path)
         self._encode(raw_audio, png_path, has_cover, final_ext, final_path, {
@@ -478,7 +494,7 @@ class DownloadPipeline:
             "date": tag_year or "",
             "genre": tag_genre or "",
             "comment": "",
-        })
+        }, duration=video_info.duration if video_info else 0)
 
         safe_file = os.path.basename(final_path)
         self._status(f"Saved: {safe_file}")
@@ -654,6 +670,7 @@ class DownloadPipeline:
         fmt: str,
         output_path: str,
         tags: dict,
+        duration: int = 0,
     ) -> None:
         """Encode the final audio file with embedded metadata and cover art."""
         ff_args = ["ffmpeg", "-y", "-v", "quiet", "-i", raw_audio]
@@ -685,17 +702,46 @@ class DownloadPipeline:
             if value or key == "comment":
                 ff_args += ["-metadata", f"{key}={value}"]
 
+        # Progress reporting on stdout; -v quiet keeps stderr to errors only
+        ff_args += ["-progress", "pipe:1", "-nostats"]
         ff_args.append(output_path)
 
-        result = subprocess.run(
+        process = subprocess.Popen(
             ff_args,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=120,
             creationflags=CREATE_NO_WINDOW,
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed: {result.stderr[:500]}")
+
+        # Anti-hang watchdog, scaled to track length (old flat 120s timeout
+        # failed legitimately long encodes). Only fires if ffmpeg truly hangs.
+        watchdog = Timer(max(300, duration * 3), process.kill)
+        watchdog.start()
+        try:
+            for line in process.stdout:
+                line = line.strip()
+                if line.startswith(("out_time_us=", "out_time_ms=")) and duration:
+                    try:
+                        us = int(line.split("=", 1)[1])
+                        frac = min(us / 1_000_000 / duration, 1.0)
+                        self._progress(80 + frac * 18, f"Encoding... {int(frac * 100)}%")
+                    except ValueError:
+                        pass
+                if self._cancel.is_set():
+                    process.kill()
+                    raise CancelledError("Download cancelled by user")
+        finally:
+            watchdog.cancel()
+            process.wait()
+
+        if process.returncode != 0:
+            stderr_text = ""
+            try:
+                stderr_text = process.stderr.read() or ""
+            except Exception:
+                pass
+            raise RuntimeError(f"ffmpeg failed: {stderr_text[:500]}")
 
     def _prune_old_runs(self) -> None:
         """Remove stale run folders older than 1 day, skipping locked ones."""

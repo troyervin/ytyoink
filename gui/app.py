@@ -24,7 +24,10 @@ from gui.styles import (
     THUMBNAIL_SIZE, WINDOW_HEIGHT, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH,
     WINDOW_WIDTH, apply_hover, configure_ttk_theme, make_card,
 )
-from gui.widgets import CheckboxEntry, ImagePreview, StatusBar
+from gui.widgets import (
+    CheckboxEntry, CollapsibleStatus, CoverTile, ImagePreview, RoundButton,
+    RoundField,
+)
 
 try:
     from PIL import Image, ImageGrab, ImageTk
@@ -63,12 +66,13 @@ class YTYoinkApp(tk.Tk):
         self._scrollbar_visible = False
         self._logo_photo = None  # prevent GC
         self._deps_ready = False  # set True after dependency check passes
-        self._tooltip_window = None
 
         self._build_window()
         configure_ttk_theme()
         self._build_layout()
         self._set_icon()
+        self._resize_job = None
+        self.bind("<Configure>", self._on_root_resize)
         self.after(50, self._enforce_min_height)
 
     def _read_edition(self) -> str:
@@ -124,12 +128,55 @@ class YTYoinkApp(tk.Tk):
             return None
 
     def _enforce_min_height(self):
-        """Resize window to exactly fit pre-fetch content — no scrollbar on open."""
+        """Size window to exactly fit compact content (log hidden) on open."""
         self.update_idletasks()
-        content_h = self._main_frame.winfo_reqheight()
+        content_h = self._main_frame.winfo_reqheight() + self._footer.winfo_reqheight()
         w = self.winfo_width() or WINDOW_WIDTH
         self.geometry(f"{w}x{content_h}")
-        self.minsize(WINDOW_MIN_WIDTH, content_h)
+        self.minsize(WINDOW_MIN_WIDTH,
+                     min(content_h, self.winfo_screenheight() - 120))
+
+    def _grow_to_fit(self):
+        """Grow the window (screen space permitting) so newly revealed
+        panels are visible without scrolling. Never shrinks."""
+        self.update_idletasks()
+        needed = self._main_frame.winfo_reqheight() + self._footer.winfo_reqheight()
+        max_h = self.winfo_screenheight() - 120  # leave room for taskbar/title bar
+        target = min(needed, max_h)
+        if target > self.winfo_height():
+            self.geometry(f"{self.winfo_width()}x{target}")
+        self._update_log_visibility()
+
+    def _on_root_resize(self, event):
+        if event.widget is not self:
+            return
+        if self._resize_job:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(60, self._update_log_visibility)
+
+    def _update_log_visibility(self):
+        """Show the command-window log only when the window has spare room.
+
+        Spare space is always measured against the *compact* layout (status
+        line, no log) so showing/hiding the log can't oscillate. The window
+        min-height tracks the compact layout, keeping content unscrollable.
+        """
+        self._resize_job = None
+        sb = self._status_bar
+        content_h = self._main_frame.winfo_reqheight()
+        footer_req = self._footer.winfo_reqheight()
+        if sb.log_visible:
+            compact_footer = footer_req - sb.log_min_req() + sb.line_req()
+        else:
+            compact_footer = footer_req
+        spare = self.winfo_height() - content_h - compact_footer
+        if sb.log_visible and spare < 60:
+            sb.set_log_visible(False)
+        elif not sb.log_visible and spare > 140:
+            sb.set_log_visible(True)
+        self.minsize(WINDOW_MIN_WIDTH,
+                     min(content_h + compact_footer,
+                         self.winfo_screenheight() - 120))
 
     def _build_window(self):
         self._edition = self._read_edition()
@@ -184,23 +231,30 @@ class YTYoinkApp(tk.Tk):
         except Exception:
             return None
 
-    def _make_button(self, parent, text, command, bg, fg, hover_bg, hover_fg=None, font=None, padx=16, pady=3, state="normal"):
-        """Create a styled button with hover effect."""
-        btn = tk.Button(
-            parent, text=text, font=font or FONT_BUTTON,
-            bg=bg, fg=fg,
-            activebackground=hover_bg, activeforeground=hover_fg or fg,
-            relief="flat", padx=padx, pady=pady, bd=0,
-            command=command, state=state,
-            cursor="hand2" if state == "normal" else "",
+    def _make_button(self, parent, text, command, bg, fg, hover_bg, hover_fg=None, font=None, padx=16, pady=4, state="normal"):
+        """Create a rounded button with hover effect."""
+        return RoundButton(
+            parent, text, command, bg, fg, hover_bg, hover_fg,
+            font=font or FONT_BUTTON, padx=padx, pady=pady, state=state,
         )
-        apply_hover(btn, bg, hover_bg, fg, hover_fg)
-        return btn
 
     def _build_layout(self):
-        # Main canvas for scroll support
-        self._canvas = tk.Canvas(self, bg=BG_MAIN, highlightthickness=0, bd=0)
-        self._scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._canvas.yview, style="Custom.Vertical.TScrollbar")
+        # Fixed footer — Download/Cancel, progress, and status log live here so
+        # they stay visible when post-fetch content grows the scroll area.
+        # Packed before the canvas so it keeps its minimum height when the
+        # window shrinks; expand=True routes any spare height into the log.
+        self._footer = tk.Frame(self, bg=BG_MAIN)
+        self._footer.pack(side="bottom", fill="both", expand=True)
+        tk.Frame(self._footer, bg=BORDER_COLOR, height=1).pack(fill="x")
+
+        # Scroll area wrapper: fills the width, but its height tracks the
+        # content's natural height (synced via canvas height config) so any
+        # leftover window space goes to the footer's log, not empty background.
+        scroll_wrap = tk.Frame(self, bg=BG_MAIN)
+        scroll_wrap.pack(side="top", fill="x", expand=False)
+
+        self._canvas = tk.Canvas(scroll_wrap, bg=BG_MAIN, highlightthickness=0, bd=0)
+        self._scrollbar = ttk.Scrollbar(scroll_wrap, orient="vertical", command=self._canvas.yview, style="Custom.Vertical.TScrollbar")
         self._canvas.configure(yscrollcommand=self._scrollbar.set)
         self._canvas.pack(side="left", fill="both", expand=True)
 
@@ -213,9 +267,9 @@ class YTYoinkApp(tk.Tk):
 
         frame = self._main_frame
 
-        # ---- Header: Logo + Title ----
+        # ---- Header: single row — logo, title, edition badge, settings ----
         header_frame = tk.Frame(frame, bg=BG_MAIN)
-        header_frame.pack(pady=(10, 2))
+        header_frame.pack(fill="x", padx=PAD_SECTION, pady=(8, 2))
 
         self._logo_photo = self._load_logo()
         if self._logo_photo:
@@ -223,49 +277,75 @@ class YTYoinkApp(tk.Tk):
                 header_frame, image=self._logo_photo, bg=BG_MAIN,
             ).pack(side="left", padx=(0, 8))
 
-        title_frame = tk.Frame(header_frame, bg=BG_MAIN)
-        title_frame.pack(side="left")
-
-        ytyoink_row = tk.Frame(title_frame, bg=BG_MAIN)
-        ytyoink_row.pack(anchor="w")
-
         tk.Label(
-            ytyoink_row, text="YTYoink", font=FONT_HEADING,
+            header_frame, text="YTYoink", font=FONT_HEADING,
             bg=BG_MAIN, fg=FG_ACCENT,
         ).pack(side="left")
 
         self._fire_photo = self._make_fire_photo(size=20)
         if self._fire_photo:
             tk.Label(
-                ytyoink_row, image=self._fire_photo, bg=BG_MAIN, padx=2,
+                header_frame, image=self._fire_photo, bg=BG_MAIN, padx=2,
             ).pack(side="left")
         else:
             tk.Label(
-                ytyoink_row, text="🔥", font=("Segoe UI Emoji", 17),
+                header_frame, text="🔥", font=("Segoe UI Emoji", 17),
                 bg=BG_MAIN,
             ).pack(side="left")
 
         tk.Label(
-            title_frame, text="YouTube Audio Downloader", font=FONT_SUBHEADING,
+            header_frame, text="YouTube Audio Downloader", font=FONT_SMALL,
             bg=BG_MAIN, fg=FG_DIM,
-        ).pack(anchor="w")
+        ).pack(side="left", padx=(10, 0))
+
+        settings_btn = self._make_button(
+            header_frame, "⚙", self._open_settings,
+            BG_MAIN, FG_LABEL, BG_BUTTON,
+            font=("Segoe UI Symbol", 13), padx=8, pady=0,
+        )
+        settings_btn.pack(side="right")
+
+        tk.Label(
+            header_frame, text=f" {self._edition} EDITION ", font=("Cascadia Code", 6),
+            bg=BG_MAIN, fg=FG_DIM,
+            highlightbackground=BORDER_COLOR, highlightcolor=BORDER_COLOR,
+            highlightthickness=1, padx=3, pady=0,
+        ).pack(side="right", padx=(0, 10))
 
         # Thin separator under header
         tk.Frame(frame, bg=BORDER_COLOR, height=1).pack(fill="x", padx=PAD_SECTION, pady=(6, 8))
 
+        # ---- Preference vars — frequently flipped toggles live inline,
+        # set-once source/format preferences live in the settings popover ----
+        self._format_var = tk.StringVar(value=self.config.format)
+        self._pref_meta_var = tk.StringVar(value=self.config.metadata_source)
+        self._pref_artwork_var = tk.StringVar(value=self.config.cover_source)
+        self._keep_overrides_var = tk.BooleanVar(value=False)
+        self._open_after_var = tk.BooleanVar(value=self.config.open_after_download)
+        self._turbo_var = tk.BooleanVar(value=self.config.turbo_mode)
+        self._settings_win = None
+
+        def title_check(row, text, var, cmd=None):
+            tk.Checkbutton(
+                row, text=text, variable=var, font=FONT_SMALL,
+                bg=BG_MAIN, fg=FG_LABEL,
+                activebackground=BG_MAIN, activeforeground=FG_TEXT,
+                selectcolor=BG_INPUT, highlightthickness=0, bd=0,
+                command=cmd,
+            ).pack(side="right")
+
         # ---- URL Input ----
         url_outer, url_inner = make_card(frame, "URL")
         url_outer.pack(fill="x", padx=PAD_SECTION, pady=PAD_Y)
+        title_check(url_outer.title_row, "Turbo", self._turbo_var,
+                    self._on_turbo_change)
 
         url_row = tk.Frame(url_inner, bg=BG_SECTION)
         url_row.pack(fill="x")
 
-        self._url_entry = tk.Entry(
-            url_row, font=FONT_INPUT, bg=BG_INPUT, fg=FG_TEXT,
-            insertbackground=FG_TEXT, relief="flat",
-            highlightthickness=1, highlightcolor=FG_ACCENT, highlightbackground=BORDER_COLOR,
-        )
-        self._url_entry.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=3)
+        self._url_field = RoundField(url_row, height=32)
+        self._url_field.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._url_entry = self._url_field.entry
 
         self._fetch_btn = self._make_button(
             url_row, "Fetch Info", self._on_fetch_info,
@@ -279,148 +359,52 @@ class YTYoinkApp(tk.Tk):
         self._url_entry.bind("<Control-v>", lambda e: self.after(100, self._on_url_paste))
         self._url_entry.bind("<FocusIn>", self._on_url_focus)
 
-        # ---- Video Info Panel (hidden until first fetch) ----
+        # ---- Video Info (compact strip, hidden until first fetch) ----
         self._info_outer = tk.Frame(frame, bg=BG_MAIN)
         # NOT packed yet — shown after first fetch
-
-        tk.Label(
-            self._info_outer, text="Video Info", font=FONT_LABEL_BOLD,
-            bg=BG_MAIN, fg=FG_LABEL, anchor="w",
-        ).pack(fill="x", padx=2, pady=(0, 3))
 
         info_card = tk.Frame(
             self._info_outer, bg=BG_SECTION,
             highlightbackground=BORDER_COLOR, highlightcolor=BORDER_COLOR,
-            highlightthickness=1, padx=PAD_CARD, pady=PAD_CARD,
+            highlightthickness=1, padx=8, pady=6,
         )
         info_card.pack(fill="x")
 
-        info_inner = tk.Frame(info_card, bg=BG_SECTION)
-        info_inner.pack(fill="x")
+        self._thumb_preview = ImagePreview(info_card, size=THUMBNAIL_SIZE)
+        self._thumb_preview.pack(side="left", padx=(0, 10))
 
-        self._thumb_preview = ImagePreview(info_inner, size=THUMBNAIL_SIZE)
-        self._thumb_preview.pack(side="left", padx=(0, PAD_X))
-
-        info_text = tk.Frame(info_inner, bg=BG_SECTION)
+        info_text = tk.Frame(info_card, bg=BG_SECTION)
         info_text.pack(side="left", fill="both", expand=True)
 
         self._info_title = tk.Label(
             info_text, text="", font=FONT_LABEL_BOLD,
-            bg=BG_SECTION, fg=FG_TEXT, wraplength=380, justify="left", anchor="nw",
+            bg=BG_SECTION, fg=FG_TEXT, wraplength=480, justify="left", anchor="nw",
         )
-        self._info_title.pack(anchor="w", pady=(0, 4))
+        self._info_title.pack(anchor="w", pady=(2, 2))
+
+        info_sub_row = tk.Frame(info_text, bg=BG_SECTION)
+        info_sub_row.pack(anchor="w")
 
         self._info_uploader = tk.Label(
-            info_text, text="", font=FONT_LABEL,
+            info_sub_row, text="", font=FONT_SMALL,
             bg=BG_SECTION, fg=FG_LABEL, anchor="w",
         )
-        self._info_uploader.pack(anchor="w", pady=(0, 2))
+        self._info_uploader.pack(side="left")
 
         self._info_duration = tk.Label(
-            info_text, text="", font=FONT_SMALL,
+            info_sub_row, text="", font=FONT_SMALL,
             bg=BG_SECTION, fg=FG_DIM, anchor="w",
         )
-        self._info_duration.pack(anchor="w")
-
-        # ---- Format + Cover Source (side by side) ----
-        self._settings_row = tk.Frame(frame, bg=BG_MAIN)
-        self._settings_row.pack(fill="x", padx=PAD_SECTION, pady=PAD_Y)
-        self._settings_row.columnconfigure(0, weight=1, uniform="settings")
-        self._settings_row.columnconfigure(1, weight=1, uniform="settings")
-        settings_row = self._settings_row  # local alias for the widget refs below
-
-        # Format
-        fmt_outer, fmt_inner = make_card(settings_row, "Output Format")
-        fmt_outer.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-
-        self._format_var = tk.StringVar(value=self.config.format)
-
-        fmt_row = tk.Frame(fmt_inner, bg=BG_SECTION)
-        fmt_row.pack(anchor="w")
-
-        tk.Radiobutton(
-            fmt_row, text="M4A (AAC 256kbps)", variable=self._format_var,
-            value="m4a", font=FONT_SMALL, bg=BG_SECTION, fg=FG_TEXT,
-            selectcolor=BG_INPUT, activebackground=BG_SECTION, activeforeground=FG_TEXT,
-            highlightthickness=0, bd=0,
-            command=self._on_format_change,
-        ).pack(side="left", padx=(0, 10))
-
-        tk.Radiobutton(
-            fmt_row, text="MP3 (VBR Q0)", variable=self._format_var,
-            value="mp3", font=FONT_SMALL, bg=BG_SECTION, fg=FG_TEXT,
-            selectcolor=BG_INPUT, activebackground=BG_SECTION, activeforeground=FG_TEXT,
-            highlightthickness=0, bd=0,
-            command=self._on_format_change,
-        ).pack(side="left")
-
-        # Preferred Source
-        pref_outer, pref_inner = make_card(settings_row, "Preferred Source")
-        pref_outer.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
-
-        self._pref_meta_var = tk.StringVar(value=self.config.metadata_source)
-        self._pref_artwork_var = tk.StringVar(value=self.config.cover_source)
-
-        # Metadata preference row
-        meta_pref_row = tk.Frame(pref_inner, bg=BG_SECTION)
-        meta_pref_row.pack(fill="x", pady=(0, 2))
-
-        tk.Label(
-            meta_pref_row, text="Metadata:", font=FONT_SMALL,
-            bg=BG_SECTION, fg=FG_LABEL, width=9, anchor="w",
-        ).pack(side="left")
-
-        tk.Radiobutton(
-            meta_pref_row, text="iTunes", variable=self._pref_meta_var,
-            value="itunes", font=FONT_SMALL, bg=BG_SECTION, fg=FG_TEXT,
-            selectcolor=BG_INPUT, activebackground=BG_SECTION, activeforeground=FG_TEXT,
-            highlightthickness=0, bd=0, command=self._on_pref_meta_change,
-        ).pack(side="left", padx=(0, 6))
-
-        tk.Radiobutton(
-            meta_pref_row, text="YouTube", variable=self._pref_meta_var,
-            value="youtube", font=FONT_SMALL, bg=BG_SECTION, fg=FG_TEXT,
-            selectcolor=BG_INPUT, activebackground=BG_SECTION, activeforeground=FG_TEXT,
-            highlightthickness=0, bd=0, command=self._on_pref_meta_change,
-        ).pack(side="left")
-
-        # Artwork preference row
-        art_pref_row = tk.Frame(pref_inner, bg=BG_SECTION)
-        art_pref_row.pack(fill="x")
-
-        tk.Label(
-            art_pref_row, text="Artwork:", font=FONT_SMALL,
-            bg=BG_SECTION, fg=FG_LABEL, width=9, anchor="w",
-        ).pack(side="left")
-
-        tk.Radiobutton(
-            art_pref_row, text="iTunes", variable=self._pref_artwork_var,
-            value="itunes", font=FONT_SMALL, bg=BG_SECTION, fg=FG_TEXT,
-            selectcolor=BG_INPUT, activebackground=BG_SECTION, activeforeground=FG_TEXT,
-            highlightthickness=0, bd=0, command=self._on_pref_artwork_change,
-        ).pack(side="left", padx=(0, 6))
-
-        tk.Radiobutton(
-            art_pref_row, text="YouTube", variable=self._pref_artwork_var,
-            value="youtube", font=FONT_SMALL, bg=BG_SECTION, fg=FG_TEXT,
-            selectcolor=BG_INPUT, activebackground=BG_SECTION, activeforeground=FG_TEXT,
-            highlightthickness=0, bd=0, command=self._on_pref_artwork_change,
-        ).pack(side="left")
+        self._info_duration.pack(side="left", padx=(8, 0))
 
         # ---- Metadata Overrides ----
         meta_outer, meta_inner = make_card(frame, "Metadata  (check to override)")
         meta_outer.pack(fill="x", padx=PAD_SECTION, pady=PAD_Y)
+        self._meta_outer = meta_outer
+        title_check(meta_outer.title_row, "Keep overrides on fetch",
+                    self._keep_overrides_var)
 
         # Metadata source toggle (shown only when iTunes data is available)
-        self._keep_overrides_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            meta_inner, text="Keep overrides on fetch",
-            variable=self._keep_overrides_var,
-            font=FONT_SMALL, bg=BG_SECTION, fg=FG_LABEL,
-            activebackground=BG_SECTION, activeforeground=FG_LABEL,
-            selectcolor=BG_INPUT, highlightthickness=0, bd=0,
-        ).pack(anchor="w", pady=(0, 4))
-
         self._meta_source_var = tk.StringVar(value=self.config.metadata_source)
         self._meta_source_frame = tk.Frame(meta_inner, bg=BG_SECTION)
         # Not packed yet — shown after fetch when iTunes data exists
@@ -459,102 +443,63 @@ class YTYoinkApp(tk.Tk):
         self._meta_genre = CheckboxEntry(meta_inner, "Genre")
         self._meta_genre.pack(fill="x", pady=2)
 
-        # Cover art preview area (always visible — custom art usable pre-fetch)
+        # Cover art tiles — click a tile to choose the artwork source.
+        # Custom tile doubles as the drop/paste/browse target.
         self._cover_preview_frame = tk.Frame(meta_inner, bg=BG_SECTION)
         self._cover_preview_frame.pack(fill="x", pady=(PAD_Y, 0))
 
-        # Thumbnail row (itunes + yt) — hidden pre-fetch, shown after fetch
-        self._covers_row = tk.Frame(self._cover_preview_frame, bg=BG_SECTION)
-        # NOT packed yet — shown in _update_cover_previews after fetch
-
-        self._itunes_cover_frame = tk.Frame(self._covers_row, bg=BG_SECTION)
-        # NOT packed yet — packed in _update_cover_previews after fetch
-        self._itunes_cover_preview = ImagePreview(self._itunes_cover_frame, size=COVER_PREVIEW_SIZE)
-        self._itunes_cover_preview.pack()
-
-        self._yt_cover_preview = ImagePreview(self._covers_row, size=COVER_PREVIEW_SIZE)
-        # NOT packed yet — packed in _update_cover_previews after fetch
-
-        # Custom cover preview — in the thumbnail row, to the right of YouTube
-        self._custom_cover_frame = tk.Frame(self._covers_row, bg=BG_SECTION)
-        # NOT packed yet — shown when Custom selected + image loaded
-        self._custom_cover_preview = ImagePreview(self._custom_cover_frame, size=COVER_PREVIEW_SIZE)
-        self._custom_cover_preview.pack()
-
         self._cover_choice_var = tk.StringVar(value="itunes")
 
-        # Radio buttons — always visible so user can pick Custom pre-fetch
-        # Order: None | Use YouTube | Use iTunes | Custom
-        self._radio_row = tk.Frame(self._cover_preview_frame, bg=BG_SECTION)
-        self._radio_row.pack(pady=(4, 0))
+        self._covers_row = tk.Frame(self._cover_preview_frame, bg=BG_SECTION)
+        self._covers_row.pack(pady=(2, 0))
 
-        self._none_art_radio = tk.Radiobutton(
-            self._radio_row, text="None", variable=self._cover_choice_var,
-            value="none", font=FONT_SMALL, bg=BG_SECTION, fg=FG_TEXT,
-            selectcolor=BG_INPUT, activebackground=BG_SECTION, activeforeground=FG_TEXT,
-            highlightthickness=0, bd=0, command=self._on_artwork_choice_change,
+        self._itunes_tile = CoverTile(
+            self._covers_row, "iTunes", lambda: self._select_cover("itunes"),
+            size=COVER_PREVIEW_SIZE,
         )
-        self._none_art_radio.grid(row=0, column=0, padx=6)
-
-        self._yt_art_radio = tk.Radiobutton(
-            self._radio_row, text="Use YouTube", variable=self._cover_choice_var,
-            value="youtube", font=FONT_SMALL, bg=BG_SECTION, fg=FG_TEXT,
-            selectcolor=BG_INPUT, activebackground=BG_SECTION, activeforeground=FG_TEXT,
-            highlightthickness=0, bd=0, command=self._on_artwork_choice_change,
+        self._yt_tile = CoverTile(
+            self._covers_row, "YouTube", lambda: self._select_cover("youtube"),
+            size=COVER_PREVIEW_SIZE,
         )
-        self._yt_art_radio.grid(row=0, column=1, padx=6)
+        # iTunes/YouTube tiles packed after fetch in _update_cover_previews
 
-        self._itunes_art_radio = tk.Radiobutton(
-            self._radio_row, text="Use iTunes", variable=self._cover_choice_var,
-            value="itunes", font=FONT_SMALL, bg=BG_SECTION, fg=FG_TEXT,
-            selectcolor=BG_INPUT, activebackground=BG_SECTION, activeforeground=FG_TEXT,
-            highlightthickness=0, bd=0, command=self._on_artwork_choice_change,
+        self._custom_tile = CoverTile(
+            self._covers_row, "Custom", self._on_custom_tile_click,
+            size=COVER_PREVIEW_SIZE,
         )
-        self._itunes_art_radio.grid(row=0, column=2, padx=6)
+        custom_hint = "Click: browse\nCtrl+V: paste\nor drop image" if HAS_WINDND \
+            else "Click: browse\nCtrl+V: paste"
+        self._custom_tile.set_placeholder(custom_hint)
+        self._custom_tile.pack(side="left", padx=6)
 
-        self._custom_art_radio = tk.Radiobutton(
-            self._radio_row, text="Custom", variable=self._cover_choice_var,
-            value="custom", font=FONT_SMALL, bg=BG_SECTION, fg=FG_TEXT,
-            selectcolor=BG_INPUT, activebackground=BG_SECTION, activeforeground=FG_TEXT,
-            highlightthickness=0, bd=0, command=self._on_artwork_choice_change,
+        self._none_tile = CoverTile(
+            self._covers_row, "None", lambda: self._select_cover("none"),
+            size=COVER_PREVIEW_SIZE,
         )
-        self._custom_art_radio.grid(row=0, column=3, padx=6)
+        self._none_tile.set_placeholder("No artwork")
+        self._none_tile.pack(side="left", padx=6)
 
-        # Custom artwork drop zone (shown when "Custom" selected)
-        self._custom_drop_frame = tk.Frame(self._cover_preview_frame, bg=BG_SECTION)
-
-        drop_hint = "Drop image, paste (Ctrl+V), or click to browse" if HAS_WINDND \
-            else "Paste (Ctrl+V) or click to browse"
-        self._drop_zone = tk.Canvas(
-            self._custom_drop_frame, bg=BG_INPUT, height=32,
-            highlightthickness=0, cursor="hand2",
-        )
-        self._drop_zone.pack(fill="x", pady=(4, 0))
-        self._drop_zone.bind("<Configure>", self._draw_drop_zone_border)
-        self._drop_zone.bind("<Button-1>", lambda e: self._on_browse_custom_art())
-        self._dz_hint_text = drop_hint
-        self._dz_file_text = ""
+        self._refresh_tile_selection()
 
         if HAS_WINDND:
-            windnd.hook_dropfiles(self._drop_zone, func=self._on_drop_files)
+            # Whole window accepts image drops → loads as custom artwork
+            windnd.hook_dropfiles(self, func=self._on_drop_files)
 
         # Bind Ctrl+V globally for clipboard paste
         self.bind_all("<Control-v>", self._on_paste_image)
 
-        # ---- Download Folder ----
-        folder_outer, folder_inner = make_card(frame, "Download Folder")
-        folder_outer.pack(fill="x", padx=PAD_SECTION, pady=PAD_Y)
+        # ---- Download Folder (inline row) ----
+        folder_row = tk.Frame(frame, bg=BG_MAIN)
+        folder_row.pack(fill="x", padx=PAD_SECTION, pady=PAD_Y)
 
-        folder_row = tk.Frame(folder_inner, bg=BG_SECTION)
-        folder_row.pack(fill="x")
+        tk.Label(
+            folder_row, text="Save to", font=FONT_LABEL_BOLD,
+            bg=BG_MAIN, fg=FG_LABEL,
+        ).pack(side="left", padx=(2, 8))
 
-        self._folder_entry = tk.Entry(
-            folder_row, font=FONT_INPUT, bg=BG_INPUT, fg=FG_TEXT,
-            insertbackground=FG_TEXT, relief="flat", state="readonly",
-            readonlybackground=BG_INPUT,
-            highlightthickness=1, highlightcolor=FG_LABEL, highlightbackground=BORDER_COLOR,
-        )
-        self._folder_entry.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=2)
+        self._folder_field = RoundField(folder_row, height=30, state="readonly")
+        self._folder_field.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._folder_entry = self._folder_field.entry
 
         if self.config.download_folder:
             self._folder_entry.config(state="normal")
@@ -573,9 +518,9 @@ class YTYoinkApp(tk.Tk):
         )
         browse_btn.pack(side="right")
 
-        # ---- Action Buttons ----
-        btn_frame = tk.Frame(frame, bg=BG_MAIN)
-        btn_frame.pack(fill="x", padx=PAD_SECTION, pady=(PAD_Y, 4))
+        # ---- Action Buttons (fixed footer) ----
+        btn_frame = tk.Frame(self._footer, bg=BG_MAIN)
+        btn_frame.pack(fill="x", padx=PAD_SECTION, pady=(10, 8))
 
         self._download_btn = self._make_button(
             btn_frame, "  Download  ", self._on_download,
@@ -591,66 +536,41 @@ class YTYoinkApp(tk.Tk):
         )
         self._cancel_btn.pack(side="left")
 
-        # Open after download checkbox
-        self._open_after_var = tk.BooleanVar(value=self.config.open_after_download)
+        # Open-after toggle — right side, aligned with the action buttons
         tk.Checkbutton(
             btn_frame, text="Open file after download", variable=self._open_after_var,
             font=FONT_SMALL, bg=BG_MAIN, fg=FG_LABEL,
-            selectcolor=BG_INPUT, activebackground=BG_MAIN, activeforeground=FG_TEXT,
-            highlightthickness=0, bd=0,
+            activebackground=BG_MAIN, activeforeground=FG_TEXT,
+            selectcolor=BG_INPUT, highlightthickness=0, bd=0,
             command=self._on_open_after_change,
         ).pack(side="right")
 
-        # Turbo mode checkbox
-        self._turbo_var = tk.BooleanVar(value=self.config.turbo_mode)
-        _turbo_cb = tk.Checkbutton(
-            btn_frame, text="Turbo", variable=self._turbo_var,
-            font=FONT_SMALL, bg=BG_MAIN, fg=FG_LABEL,
-            selectcolor=BG_INPUT, activebackground=BG_MAIN, activeforeground=FG_TEXT,
-            highlightthickness=0, bd=0,
-            command=self._on_turbo_change,
-        )
-        _turbo_cb.pack(side="right", padx=(0, 10))
-        self._make_tooltip(
-            _turbo_cb,
-            "Turbo: skip preview and auto-download on fetch.\n"
-            "Uses your preferred source settings.\n"
-            "Expand Video Info first to pre-set overrides.",
-        )
-
         # ---- Last Download (clickable — reveals file in Explorer) ----
+        # Not packed until the first download completes (avoids an empty gap)
         self._last_dl_label = tk.Label(
-            frame, text="", font=FONT_SMALL,
+            self._footer, text="", font=FONT_SMALL,
             bg=BG_MAIN, fg=FG_DIM, anchor="w", cursor="hand2",
         )
-        self._last_dl_label.pack(fill="x", padx=PAD_SECTION + 2, pady=(2, 0))
         self._last_dl_label.bind("<Button-1>", self._on_last_dl_click)
 
         # ---- Progress Bar ----
         self._progress_var = tk.DoubleVar(value=0)
         self._progress_bar = ttk.Progressbar(
-            frame, variable=self._progress_var,
+            self._footer, variable=self._progress_var,
             maximum=100, mode="determinate",
             style="Custom.Horizontal.TProgressbar",
         )
-        self._progress_bar.pack(fill="x", padx=PAD_SECTION, pady=(PAD_Y, 3))
+        self._progress_bar.pack(fill="x", padx=PAD_SECTION, pady=(0, 4))
 
-        # ---- Status Area ----
-        self._status_bar = StatusBar(frame, height=7)
-        self._status_bar.pack(fill="both", expand=True, padx=PAD_SECTION, pady=(3, 6))
-
-        # "SERG EDITION" badge at very bottom
-        tk.Label(
-            frame, text=f" {self._edition} EDITION ", font=("Cascadia Code", 6),
-            bg=BG_MAIN, fg=FG_DIM,
-            highlightbackground=BORDER_COLOR, highlightcolor=BORDER_COLOR,
-            highlightthickness=1, padx=3, pady=0,
-        ).pack(pady=(0, PAD_SECTION))
+        # ---- Status Area — command-window log when roomy, one line when not ----
+        self._status_bar = CollapsibleStatus(self._footer, height=3)
+        self._status_bar.pack(fill="both", expand=True, padx=PAD_SECTION, pady=(3, 8))
 
     # ---- Scrolling ----
 
     def _on_frame_configure(self, event):
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"),
+                               height=self._main_frame.winfo_reqheight())
         self._update_scrollbar_visibility()
 
     def _on_canvas_configure(self, event):
@@ -670,11 +590,13 @@ class YTYoinkApp(tk.Tk):
         natural_h = self._main_frame.winfo_reqheight()
         canvas_h = self._canvas.winfo_height()
         canvas_w = self._canvas.winfo_width()
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"),
+                               height=natural_h)
         if canvas_w > 1:
             self._canvas.itemconfig(self._canvas_window, width=canvas_w)
         self._canvas.itemconfig(self._canvas_window, height=max(natural_h, canvas_h))
         self._update_scrollbar_visibility()
+        self._update_log_visibility()
 
     def _update_scrollbar_visibility(self):
         # Compare the *natural* content height (not the stretched height) so
@@ -882,15 +804,15 @@ class YTYoinkApp(tk.Tk):
         self._info_title.config(text=info.title)
         self._info_uploader.config(text=info.uploader)
         mins, secs = divmod(info.duration, 60)
-        self._info_duration.config(text=f"Duration: {mins}:{secs:02d}")
+        self._info_duration.config(text=f"·  {mins}:{secs:02d}")
 
         if yt_thumb:
             self._thumb_preview.set_image(yt_thumb)
         else:
-            self._thumb_preview.set_placeholder("No thumbnail")
+            self._thumb_preview.set_placeholder("No\nthumb")
 
-        # Show video info panel (first time) — inserted before Format/Source row
-        self._info_outer.pack(fill="x", padx=PAD_SECTION, pady=PAD_Y, before=self._settings_row)
+        # Show video info strip (first time) — inserted before the metadata card
+        self._info_outer.pack(fill="x", padx=PAD_SECTION, pady=PAD_Y, before=self._meta_outer)
 
         # Show/hide metadata source toggle
         if itunes_meta:
@@ -915,6 +837,7 @@ class YTYoinkApp(tk.Tk):
         self._status_bar.append("Video info fetched successfully.", "success")
         self._set_ui_state("ready")
         self.after(0, self._sync_canvas)
+        self.after(0, self._grow_to_fit)
 
         if self._turbo_var.get():
             self.after(50, self._on_download)
@@ -927,30 +850,59 @@ class YTYoinkApp(tk.Tk):
         self.config.turbo_mode = self._turbo_var.get()
         self.config.save()
 
-    def _make_tooltip(self, widget, text: str):
-        def on_enter(e):
-            if self._tooltip_window:
-                return
-            x = widget.winfo_rootx() + 20
-            y = widget.winfo_rooty() - 60
-            self._tooltip_window = tw = tk.Toplevel(self)
-            tw.wm_overrideredirect(True)
-            tw.wm_geometry(f"+{x}+{y}")
+    def _open_settings(self):
+        """Open (or focus) the settings window with the set-once preferences."""
+        if self._settings_win is not None and self._settings_win.winfo_exists():
+            self._settings_win.lift()
+            self._settings_win.focus_set()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Settings")
+        win.configure(bg=BG_SECTION)
+        win.resizable(False, False)
+        win.transient(self)
+        win.geometry(f"+{self.winfo_rootx() + self.winfo_width() - 300}+{self.winfo_rooty() + 50}")
+        self._settings_win = win
+
+        body = tk.Frame(win, bg=BG_SECTION, padx=14, pady=12)
+        body.pack(fill="both", expand=True)
+
+        def section(text, first=False):
             tk.Label(
-                tw, text=text, font=FONT_SMALL,
-                bg="#1e1e2e", fg=FG_TEXT,
-                relief="flat", padx=8, pady=5,
-                highlightbackground=BORDER_COLOR, highlightthickness=1,
-                justify="left",
-            ).pack()
+                body, text=text, font=FONT_LABEL_BOLD,
+                bg=BG_SECTION, fg=FG_LABEL,
+            ).pack(anchor="w", pady=((0 if first else 10), 2))
 
-        def on_leave(e):
-            if self._tooltip_window:
-                self._tooltip_window.destroy()
-                self._tooltip_window = None
+        def radio_row(options, var, cmd):
+            row = tk.Frame(body, bg=BG_SECTION)
+            row.pack(anchor="w")
+            for text, value in options:
+                tk.Radiobutton(
+                    row, text=text, variable=var, value=value,
+                    font=FONT_SMALL, bg=BG_SECTION, fg=FG_TEXT,
+                    selectcolor=BG_INPUT, activebackground=BG_SECTION,
+                    activeforeground=FG_TEXT, highlightthickness=0, bd=0,
+                    command=cmd,
+                ).pack(side="left", padx=(0, 10))
 
-        widget.bind("<Enter>", on_enter)
-        widget.bind("<Leave>", on_leave)
+        section("Output format", first=True)
+        radio_row([("M4A (AAC 256kbps)", "m4a"), ("MP3 (VBR Q0)", "mp3")],
+                  self._format_var, self._on_format_change)
+
+        section("Preferred metadata")
+        radio_row([("iTunes", "itunes"), ("YouTube", "youtube")],
+                  self._pref_meta_var, self._on_pref_meta_change)
+
+        section("Preferred artwork")
+        radio_row([("iTunes", "itunes"), ("YouTube", "youtube")],
+                  self._pref_artwork_var, self._on_pref_artwork_change)
+
+        tk.Label(
+            body, text="Turbo skips the preview and auto-downloads on fetch\n"
+                       "using the preferences above.",
+            font=FONT_SMALL, bg=BG_SECTION, fg=FG_DIM, justify="left",
+        ).pack(anchor="w", pady=(10, 0))
 
     def _on_format_change(self):
         self.config.format = self._format_var.get()
@@ -985,49 +937,30 @@ class YTYoinkApp(tk.Tk):
         """
         self._apply_meta_source()
 
-    def _on_artwork_choice_change(self):
-        """User switched artwork choice on-the-fly in the cover art radios.
+    def _select_cover(self, value: str):
+        """Set the artwork choice and highlight the matching tile.
 
         Ephemeral per-fetch override — does NOT update the saved preference.
-        Shows/hides the custom drop zone based on selection.
         """
+        self._cover_choice_var.set(value)
+        self._refresh_tile_selection()
+
+    def _refresh_tile_selection(self):
         val = self._cover_choice_var.get()
-        if val == "custom":
-            self._custom_drop_frame.pack(fill="x", pady=(4, 0))
-            if self._custom_cover_bytes:
-                self._custom_cover_frame.pack(side="left")
-                self._covers_row.pack(pady=(0, PAD_Y), before=self._radio_row)
-        else:
-            self._custom_drop_frame.pack_forget()
-            self._custom_cover_frame.pack_forget()
-            # Hide covers_row if no fetch art either
-            if not (self._yt_thumb_bytes or self._itunes_cover_bytes):
-                self._covers_row.pack_forget()
-            # Clear custom art when user explicitly picks another option
-            self._custom_cover_path = None
-            self._custom_cover_bytes = None
-            self._dz_file_text = ""
-            self._draw_drop_zone_border()
-        self.after(0, self._sync_canvas)
+        for value, tile in (("itunes", self._itunes_tile),
+                            ("youtube", self._yt_tile),
+                            ("custom", self._custom_tile),
+                            ("none", self._none_tile)):
+            tile.set_selected(value == val)
 
-    def _draw_drop_zone_border(self, event=None):
-        """Draw dashed border and text on the drop zone canvas."""
-        c = self._drop_zone
-        c.delete("all")
-        w = c.winfo_width() or 200
-        h = c.winfo_height() or 32
-        c.create_rectangle(
-            3, 3, w - 3, h - 3,
-            outline=FG_ACCENT, dash=(6, 4), width=1,
-        )
-        if self._dz_file_text:
-            c.create_text(w // 2, h // 2, text=f"{self._dz_file_text}  \u2022  click to change",
-                          fill=FG_ACCENT, font=FONT_SMALL, anchor="center")
+    def _on_custom_tile_click(self):
+        """Custom tile: select it if an image is loaded, otherwise browse."""
+        if self._custom_cover_bytes:
+            self._select_cover("custom")
         else:
-            c.create_text(w // 2, h // 2, text=self._dz_hint_text,
-                          fill=FG_DIM, font=FONT_SMALL, anchor="center")
+            self._on_browse_custom_art()
 
-    def _load_custom_image(self, data: bytes, path: str | None, label: str):
+    def _load_custom_image(self, data: bytes, path: str | None):
         """Shared loader for custom artwork from browse, paste, or drop."""
         import tempfile
 
@@ -1039,11 +972,8 @@ class YTYoinkApp(tk.Tk):
 
         self._custom_cover_path = path
         self._custom_cover_bytes = data
-        self._custom_cover_preview.set_image(data, "Custom")
-        self._custom_cover_frame.pack(side="left")
-        self._covers_row.pack(pady=(0, PAD_Y), before=self._radio_row)
-        self._dz_file_text = label
-        self._draw_drop_zone_border()
+        self._custom_tile.set_image(data)
+        self._select_cover("custom")
         self.after(0, self._sync_canvas)
 
     def _on_browse_custom_art(self):
@@ -1060,17 +990,16 @@ class YTYoinkApp(tk.Tk):
         try:
             with open(path, "rb") as f:
                 data = f.read()
-            self._load_custom_image(data, path, os.path.basename(path))
+            self._load_custom_image(data, path)
         except Exception as e:
-            self._dz_file_text = f"Error: {e}"
-            self._draw_drop_zone_border()
+            self._status_bar.append(f"Could not load image: {e}", "warning")
 
     def _on_paste_image(self, event=None):
-        """Handle Ctrl+V — load image from clipboard if Custom artwork is active."""
-        if self._cover_choice_var.get() != "custom":
-            return
-        if not self._cover_preview_frame.winfo_ismapped():
-            return
+        """Handle Ctrl+V — load a clipboard image as custom artwork.
+
+        Never interferes with text pastes: grabclipboard() returns None
+        for text, so pasting a URL into an entry works normally.
+        """
         if not HAS_PIL:
             return
 
@@ -1087,8 +1016,7 @@ class YTYoinkApp(tk.Tk):
         if isinstance(clip, Image.Image):
             buf = io.BytesIO()
             clip.save(buf, format="PNG")
-            data = buf.getvalue()
-            self._load_custom_image(data, None, "Pasted from clipboard")
+            self._load_custom_image(buf.getvalue(), None)
         elif isinstance(clip, list):
             # List of file paths from clipboard
             img_exts = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
@@ -1097,7 +1025,7 @@ class YTYoinkApp(tk.Tk):
                         fpath.lower().endswith(img_exts):
                     with open(fpath, "rb") as f:
                         data = f.read()
-                    self._load_custom_image(data, fpath, os.path.basename(fpath))
+                    self._load_custom_image(data, fpath)
                     break
 
     def _on_drop_files(self, files):
@@ -1110,10 +1038,7 @@ class YTYoinkApp(tk.Tk):
                 try:
                     with open(fpath, "rb") as f:
                         data = f.read()
-                    # Auto-select Custom radio if not already
-                    self._cover_choice_var.set("custom")
-                    self._custom_drop_frame.pack(fill="x", pady=(4, 0))
-                    self._load_custom_image(data, fpath, os.path.basename(fpath))
+                    self._load_custom_image(data, fpath)
                 except Exception:
                     pass
                 break
@@ -1135,49 +1060,39 @@ class YTYoinkApp(tk.Tk):
         self._meta_genre.set_auto_value(meta["genre"])
 
     def _update_cover_previews(self):
-        """Populate cover thumbnails after fetch. Pack in order: iTunes, YouTube, Custom."""
+        """Populate cover tiles after fetch. Order: iTunes, YouTube, Custom, None."""
         # Reset pack order each time so re-fetching doesn't scramble positions
-        self._itunes_cover_frame.pack_forget()
-        self._yt_cover_preview.pack_forget()
-        self._custom_cover_frame.pack_forget()
+        self._itunes_tile.pack_forget()
+        self._yt_tile.pack_forget()
+        self._custom_tile.pack_forget()
+        self._none_tile.pack_forget()
 
-        # iTunes — leftmost
         if self._itunes_cover_bytes:
-            self._itunes_cover_frame.pack(side="left", padx=(0, 12))
-            self._itunes_cover_preview.set_image(self._itunes_cover_bytes, "iTunes")
-            self._itunes_art_radio.grid()
-        else:
-            self._itunes_art_radio.grid_remove()
-
-        # YouTube — middle
+            self._itunes_tile.set_image(self._itunes_cover_bytes)
+            self._itunes_tile.pack(side="left", padx=6)
         if self._yt_thumb_bytes:
-            self._yt_cover_preview.pack(side="left", padx=(0, 12))
-            self._yt_cover_preview.set_image(self._yt_thumb_bytes, "YouTube")
+            self._yt_tile.set_image(self._yt_thumb_bytes)
+            self._yt_tile.pack(side="left", padx=6)
+        self._custom_tile.pack(side="left", padx=6)
+        self._none_tile.pack(side="left", padx=6)
 
-        # Custom — rightmost (persists across fetches)
-        if self._custom_cover_bytes:
-            self._cover_choice_var.set("custom")
-            self._custom_cover_frame.pack(side="left")
-            self._custom_cover_preview.set_image(self._custom_cover_bytes, "Custom")
-            self._custom_drop_frame.pack(fill="x", pady=(4, 0))
-        else:
-            self._custom_drop_frame.pack_forget()
-            # No custom art — pre-select from saved preference
-            if self._itunes_cover_bytes:
-                pref = self.config.cover_source
-                if pref in ("itunes", "youtube", "none"):
-                    self._cover_choice_var.set(pref)
-                else:
-                    self._cover_choice_var.set("itunes")
-            elif self._yt_thumb_bytes:
-                if self._cover_choice_var.get() == "itunes":
-                    self._cover_choice_var.set("youtube")
-
-        # Show thumbnail row if anything to display
-        if self._itunes_cover_bytes or self._yt_thumb_bytes or self._custom_cover_bytes:
-            self._covers_row.pack(pady=(0, PAD_Y), before=self._radio_row)
-        else:
-            self._covers_row.pack_forget()
+        # Custom art persists across fetches, but only stays *selected* if it
+        # was the active choice — otherwise the saved preference applies.
+        if self._custom_cover_bytes and self._cover_choice_var.get() == "custom":
+            pass
+        elif self._itunes_cover_bytes:
+            pref = self.config.cover_source
+            if pref not in ("itunes", "youtube", "none"):
+                pref = "itunes"
+            if pref == "youtube" and not self._yt_thumb_bytes:
+                pref = "itunes"
+            self._cover_choice_var.set(pref)
+        elif self._yt_thumb_bytes:
+            if self._cover_choice_var.get() == "itunes":
+                self._cover_choice_var.set("youtube")
+        elif self._cover_choice_var.get() in ("itunes", "youtube"):
+            self._cover_choice_var.set("none")
+        self._refresh_tile_selection()
 
     def _on_browse_folder(self):
         folder = filedialog.askdirectory(
@@ -1272,6 +1187,14 @@ class YTYoinkApp(tk.Tk):
     def _on_download_complete(self, result):
         self._last_download = result.filename
         self._last_download_path = result.output_path
+        if not self._last_dl_label.winfo_ismapped():
+            self._last_dl_label.pack(
+                fill="x", padx=PAD_SECTION + 2, pady=(0, 2),
+                before=self._progress_bar,
+            )
+            # Footer grew a row — grow the window to match so the content
+            # area isn't squeezed into showing a scrollbar.
+            self.after(0, self._grow_to_fit)
         self._last_dl_label.config(
             text=f"Last download: {result.filename}",
             fg=FG_ACCENT,
