@@ -1,6 +1,6 @@
 """YTYoink version — bump this before each release build."""
 
-APP_VERSION = "1.1.31"
+APP_VERSION = "1.1.32"
 
 # Base URL where version.json and YTYoink.exe are hosted.
 GITHUB_REPO = "troyervin/ytyoink"
