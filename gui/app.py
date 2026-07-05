@@ -1395,8 +1395,15 @@ class YTYoinkApp(tk.Tk):
             self._status_bar.append("Download folder not set or does not exist.", "warning")
 
     def _on_last_dl_click(self, event=None):
-        if self._last_download_path and os.path.isfile(self._last_download_path):
-            subprocess.run(["explorer", "/select,", self._last_download_path])
+        if not self._last_download_path:
+            return
+        # explorer needs backslashes — forward slashes send it to Documents
+        path = os.path.normpath(self._last_download_path)
+        if os.path.isfile(path):
+            subprocess.run(["explorer", "/select," + path])
+        elif os.path.isdir(os.path.dirname(path)):
+            # File may have been moved (e.g. iTunes auto-import) — open folder
+            os.startfile(os.path.dirname(path))
 
     def _on_open_after_change(self):
         self.config.open_after_download = self._open_after_var.get()
@@ -1481,7 +1488,7 @@ class YTYoinkApp(tk.Tk):
         )
         self._last_dl_label.bind("<Enter>", lambda e: self._last_dl_label.config(fg=FG_TEXT))
         self._last_dl_label.bind("<Leave>", lambda e: self._last_dl_label.config(fg=FG_ACCENT))
-        self._status_bar.append(f"Saved: {result.filename}", "success")
+        self._status_bar.append("Download complete.", "success")
         self._progress_var.set(100)
         self._set_ui_state("ready")
 

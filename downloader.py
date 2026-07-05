@@ -497,7 +497,6 @@ class DownloadPipeline:
         }, duration=video_info.duration if video_info else 0)
 
         safe_file = os.path.basename(final_path)
-        self._status(f"Saved: {safe_file}")
         self._progress(100, f"Saved: {safe_file}")
 
         return DownloadResult(
