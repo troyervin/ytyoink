@@ -251,18 +251,27 @@ class CheckboxEntry(tk.Frame):
 class ImagePreview(tk.Frame):
     """Displays a rounded-corner image preview with a label underneath."""
 
+    ZOOM_SIZE = 320
+
     def __init__(self, parent, size: tuple[int, int] = (140, 140), **kwargs):
         super().__init__(parent, bg=BG_SECTION, **kwargs)
         self._size = size
         self._photo = None
         self._pil_base = None
+        self._pil_full = None  # original-res square crop for hover zoom
         self._selected = False
+        self._zoom_win = None
+        self._zoom_job = None
+        self._zoom_photo = None
 
         self._canvas = tk.Label(
             self, bg=BG_SECTION, bd=0, highlightthickness=0,
             compound="center", font=FONT_SMALL, fg=FG_DIM,
         )
         self._canvas.pack(padx=2, pady=2)
+        self._canvas.bind("<Enter>", self._schedule_zoom)
+        self._canvas.bind("<Leave>", self._hide_zoom)
+        self._canvas.bind("<Button-1>", self._hide_zoom)
 
         self._label = tk.Label(
             self,
@@ -316,6 +325,9 @@ class ImagePreview(tk.Frame):
             left = (w - side) // 2
             top = (h - side) // 2
             img = img.crop((left, top, left + side, top + side))
+            # Keep an original-res copy (capped) for the hover zoom preview
+            full = img if side <= 700 else img.resize((700, 700), Image.LANCZOS)
+            self._pil_full = full
             self._pil_base = img.resize(self._size, Image.LANCZOS)
             self._canvas.config(text="")
             self._render_tile()
@@ -326,10 +338,13 @@ class ImagePreview(tk.Frame):
             )
             self._photo = None
             self._pil_base = None
+            self._pil_full = None
 
         self._set_label(label)
 
     def set_placeholder(self, text: str = "No preview") -> None:
+        self._pil_full = None
+        self._hide_zoom()
         if HAS_PIL:
             self._pil_base = Image.new("RGBA", self._size, BG_INPUT)
             self._canvas.config(text=text)
@@ -345,8 +360,68 @@ class ImagePreview(tk.Frame):
     def clear(self) -> None:
         self._photo = None
         self._pil_base = None
+        self._pil_full = None
+        self._hide_zoom()
         self._canvas.config(image="", text="")
         self._set_label("")
+
+    # ---- Hover zoom: larger preview above the tile ----
+
+    def _schedule_zoom(self, event=None):
+        if self._pil_full is None or self._zoom_win is not None:
+            return
+        if self._zoom_job:
+            self.after_cancel(self._zoom_job)
+        self._zoom_job = self.after(350, self._show_zoom)
+
+    def _show_zoom(self):
+        self._zoom_job = None
+        if self._pil_full is None or self._zoom_win is not None:
+            return
+        size = self.ZOOM_SIZE
+        img = self._pil_full.resize((size, size), Image.LANCZOS).convert("RGBA")
+        radius = 14
+        mask = Image.new("L", (size * _SS, size * _SS), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            (0, 0, size * _SS - 1, size * _SS - 1), radius=radius * _SS, fill=255)
+        img.putalpha(mask.resize((size, size), Image.LANCZOS))
+        ring = Image.new("RGBA", (size * _SS, size * _SS), (0, 0, 0, 0))
+        ImageDraw.Draw(ring).rounded_rectangle(
+            (_SS, _SS, size * _SS - 1 - _SS, size * _SS - 1 - _SS),
+            radius=radius * _SS, outline=BORDER_COLOR, width=2 * _SS)
+        img.alpha_composite(ring.resize((size, size), Image.LANCZOS))
+
+        self._zoom_photo = ImageTk.PhotoImage(img)
+        tw = tk.Toplevel(self)
+        tw.wm_overrideredirect(True)
+        tw.attributes("-topmost", True)
+        key = "#010203"  # transparency key color for the rounded corners
+        tw.configure(bg=key)
+        try:
+            tw.attributes("-transparentcolor", key)
+        except tk.TclError:
+            pass
+        tk.Label(tw, image=self._zoom_photo, bg=key, bd=0).pack()
+
+        # Above the tile when there's room, otherwise below — never over it,
+        # or Enter/Leave would flicker.
+        screen_w = self.winfo_screenwidth()
+        x = self.winfo_rootx() + self.winfo_width() // 2 - size // 2
+        x = max(8, min(x, screen_w - size - 8))
+        y = self.winfo_rooty() - size - 10
+        if y < 5:
+            y = self.winfo_rooty() + self.winfo_height() + 10
+        tw.wm_geometry(f"+{x}+{y}")
+        self._zoom_win = tw
+
+    def _hide_zoom(self, event=None):
+        if self._zoom_job:
+            self.after_cancel(self._zoom_job)
+            self._zoom_job = None
+        if self._zoom_win is not None:
+            self._zoom_win.destroy()
+            self._zoom_win = None
+            self._zoom_photo = None
 
 
 class CoverTile(ImagePreview):
@@ -363,7 +438,8 @@ class CoverTile(ImagePreview):
         self._command = command
         self._set_label(name)
         for w in (self, self._canvas, self._label):
-            w.bind("<Button-1>", self._on_click)
+            # add="+" keeps ImagePreview's hover-zoom bindings alive
+            w.bind("<Button-1>", self._on_click, add="+")
             w.config(cursor="hand2")
 
     def _on_click(self, event=None):
