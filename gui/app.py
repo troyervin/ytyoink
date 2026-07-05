@@ -1108,12 +1108,6 @@ class YTYoinkApp(tk.Tk):
         radio_row([("iTunes", "itunes"), ("YouTube", "youtube")],
                   self._pref_artwork_var, self._on_pref_artwork_change)
 
-        tk.Label(
-            body, text="Turbo skips the preview and auto-downloads on fetch\n"
-                       "using the preferences above.",
-            font=FONT_SMALL, bg=BG_SECTION, fg=FG_DIM, justify="left",
-        ).pack(anchor="w", pady=(10, 0))
-
     def _on_format_change(self):
         self.config.format = self._format_var.get()
         self.config.save()
