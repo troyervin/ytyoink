@@ -73,7 +73,81 @@ class YTYoinkApp(tk.Tk):
         self._set_icon()
         self._resize_job = None
         self.bind("<Configure>", self._on_root_resize)
+        self.after(10, self._strip_native_titlebar)
         self.after(50, self._enforce_min_height)
+
+    def _strip_native_titlebar(self):
+        """Remove the Windows caption bar. Keeps the resize borders, the
+        taskbar entry, and Win+arrow snapping — unlike overrideredirect.
+        The app header provides its own title, icon, and window buttons."""
+        try:
+            import ctypes
+            GWL_STYLE = -16
+            WS_CAPTION = 0x00C00000
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(self.winfo_id())
+            get_style = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+            set_style = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+            style = get_style(hwnd, GWL_STYLE)
+            set_style(hwnd, GWL_STYLE, style & ~WS_CAPTION)
+            # SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED
+            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)
+            try:
+                # Dark frame + border painted in the app background color so
+                # no light line shows at the window edges (Win10 1809+/Win11).
+                dwm = ctypes.windll.dwmapi
+                dark = ctypes.c_int(1)
+                for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (+legacy)
+                    if dwm.DwmSetWindowAttribute(
+                            hwnd, attr, ctypes.byref(dark), 4) == 0:
+                        break
+                DWMWA_BORDER_COLOR = 34
+                color = ctypes.c_int(0x00251818)  # COLORREF (BGR) of #181825
+                dwm.DwmSetWindowAttribute(
+                    hwnd, DWMWA_BORDER_COLOR, ctypes.byref(color), 4)
+            except Exception:
+                pass  # older Windows — keep the default border
+        except Exception:
+            pass
+
+    def _toggle_maximize(self):
+        self.state("normal" if self.state() == "zoomed" else "zoomed")
+
+    def _force_redraw(self):
+        """Repaint and re-sync layout after a zoom transition.
+
+        With the caption stripped, leaving the zoomed state desyncs Tk's
+        idea of the client area from the real window — a 1px geometry
+        nudge forces a full re-layout, then a native repaint cleans up.
+        """
+        try:
+            w, h = self.winfo_width(), self.winfo_height()
+            if self.state() == "normal":
+                self.geometry(f"{w}x{h + 1}")
+                self.after(30, lambda: self.geometry(f"{w}x{h}"))
+            # Re-sync the scroll canvas (its embedded frame is what loses
+            # its pixels), then force a native repaint of everything else.
+            self.after(80, self._sync_canvas)
+
+            def native_redraw():
+                try:
+                    import ctypes
+                    # RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW
+                    flags = 0x1 | 0x4 | 0x80 | 0x100
+                    inner = self.winfo_id()
+                    outer = ctypes.windll.user32.GetParent(inner)
+                    ctypes.windll.user32.RedrawWindow(outer, None, None, flags)
+                    ctypes.windll.user32.RedrawWindow(inner, None, None, flags)
+                except Exception:
+                    pass
+
+            self.after(140, native_redraw)
+            # Second pass after everything has settled — clears any stale
+            # pixels the first pass raced against.
+            self.after(450, self._sync_canvas)
+            self.after(500, native_redraw)
+        except Exception:
+            pass
 
     def _read_edition(self) -> str:
         """Read edition name from edition.key beside the exe. Defaults to TREE."""
@@ -150,6 +224,14 @@ class YTYoinkApp(tk.Tk):
     def _on_root_resize(self, event):
         if event.widget is not self:
             return
+        # Keep the maximize/restore glyph in sync with the window state
+        if hasattr(self, "_max_btn"):
+            glyph = "" if self.state() == "zoomed" else ""
+            if self._max_btn.cget("text") != glyph:
+                self._max_btn.config(text=glyph)
+                # With the caption stripped, zoom transitions leave stale
+                # pixels behind - force a full native repaint.
+                self.after(50, self._force_redraw)
         if self._resize_job:
             self.after_cancel(self._resize_job)
         self._resize_job = self.after(60, self._update_log_visibility)
@@ -267,43 +349,68 @@ class YTYoinkApp(tk.Tk):
 
         frame = self._main_frame
 
-        # ---- Header: single row — logo, title, edition badge, settings ----
+        # ---- Header: acts as the title bar — branding, edition badge,
+        # settings, and custom window controls (native caption is stripped) ----
         header_frame = tk.Frame(frame, bg=BG_MAIN)
-        header_frame.pack(fill="x", padx=PAD_SECTION, pady=(8, 2))
+        header_frame.pack(fill="x", padx=(PAD_SECTION, 4), pady=(6, 2))
+
+        drag_widgets = [header_frame]
 
         self._logo_photo = self._load_logo()
         if self._logo_photo:
-            tk.Label(
-                header_frame, image=self._logo_photo, bg=BG_MAIN,
-            ).pack(side="left", padx=(0, 8))
+            logo_lbl = tk.Label(header_frame, image=self._logo_photo, bg=BG_MAIN)
+            logo_lbl.pack(side="left", padx=(0, 8))
+            drag_widgets.append(logo_lbl)
 
-        tk.Label(
+        title_lbl = tk.Label(
             header_frame, text="YTYoink", font=FONT_HEADING,
             bg=BG_MAIN, fg=FG_ACCENT,
-        ).pack(side="left")
+        )
+        title_lbl.pack(side="left")
+        drag_widgets.append(title_lbl)
 
         self._fire_photo = self._make_fire_photo(size=20)
         if self._fire_photo:
-            tk.Label(
-                header_frame, image=self._fire_photo, bg=BG_MAIN, padx=2,
-            ).pack(side="left")
+            fire_lbl = tk.Label(
+                header_frame, image=self._fire_photo, bg=BG_MAIN, padx=2)
         else:
-            tk.Label(
-                header_frame, text="🔥", font=("Segoe UI Emoji", 17),
-                bg=BG_MAIN,
-            ).pack(side="left")
+            fire_lbl = tk.Label(
+                header_frame, text="🔥", font=("Segoe UI Emoji", 17), bg=BG_MAIN)
+        fire_lbl.pack(side="left")
+        drag_widgets.append(fire_lbl)
 
-        tk.Label(
+        sub_lbl = tk.Label(
             header_frame, text="YouTube Audio Downloader", font=FONT_SMALL,
             bg=BG_MAIN, fg=FG_DIM,
-        ).pack(side="left", padx=(10, 0))
+        )
+        sub_lbl.pack(side="left", padx=(10, 0))
+        drag_widgets.append(sub_lbl)
+
+        # Window controls — minimize / maximize / close (Segoe MDL2 glyphs)
+        controls = tk.Frame(header_frame, bg=BG_MAIN)
+        controls.pack(side="right")
+
+        def win_btn(glyph, cmd, hover_bg, hover_fg=None):
+            b = tk.Label(
+                controls, text=glyph, font=("Segoe MDL2 Assets", 10),
+                bg=BG_MAIN, fg=FG_LABEL, width=4, pady=5, cursor="hand2",
+            )
+            b.pack(side="left")
+            b.bind("<Enter>", lambda e: b.config(bg=hover_bg, fg=hover_fg or FG_TEXT))
+            b.bind("<Leave>", lambda e: b.config(bg=BG_MAIN, fg=FG_LABEL))
+            b.bind("<Button-1>", lambda e: cmd())
+            return b
+
+        win_btn("", self.iconify, BG_BUTTON)                   # minimize
+        self._max_btn = win_btn("", self._toggle_maximize, BG_BUTTON)
+        win_btn("", self.destroy, BG_BUTTON_CANCEL, "#181825")  # close
 
         settings_btn = self._make_button(
             header_frame, "⚙", self._open_settings,
             BG_MAIN, FG_LABEL, BG_BUTTON,
             font=("Segoe UI Symbol", 13), padx=8, pady=0,
         )
-        settings_btn.pack(side="right")
+        settings_btn.pack(side="right", padx=(0, 6))
 
         tk.Label(
             header_frame, text=f" {self._edition} EDITION ", font=("Cascadia Code", 6),
@@ -311,6 +418,55 @@ class YTYoinkApp(tk.Tk):
             highlightbackground=BORDER_COLOR, highlightcolor=BORDER_COLOR,
             highlightthickness=1, padx=3, pady=0,
         ).pack(side="right", padx=(0, 10))
+
+        # Drag-to-move + double-click-to-maximize on the branding area.
+        # Dragging is handed to Windows (WM_NCLBUTTONDOWN + HTCAPTION) so it
+        # moves in the native modal loop: smooth, no repaint flicker, and
+        # Aero edge-snapping works like a real title bar.
+        self._last_header_click = 0
+        self._header_press = None
+
+        def on_press(event):
+            # Manual double-click detection — the native move loop would
+            # otherwise swallow the second click.
+            if event.time - self._last_header_click < 400:
+                self._last_header_click = 0
+                self._header_press = None
+                self._toggle_maximize()
+                return "break"
+            self._last_header_click = event.time
+            self._header_press = (event.x_root, event.y_root)
+
+        def on_motion(event):
+            # Enter the native move loop only after real movement — starting
+            # it on the bare click causes a visible hiccup while Tk's
+            # implicit grab and the loop fight over the pointer.
+            if self._header_press is None or self.state() == "zoomed":
+                return
+            dx = abs(event.x_root - self._header_press[0])
+            dy = abs(event.y_root - self._header_press[1])
+            if dx + dy < 4:
+                return
+            self._header_press = None
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+                ctypes.windll.user32.ReleaseCapture()
+                # PostMessage, NOT SendMessage: the native move loop must run
+                # from Tk's own message pump. SendMessage blocks inside the
+                # ctypes call with the GIL released and Python callbacks from
+                # the loop then crash the interpreter (fatal GIL error).
+                ctypes.windll.user32.PostMessageW(hwnd, 0xA1, 2, 0)
+            except Exception:
+                pass
+
+        def on_release(event):
+            self._header_press = None
+
+        for w in drag_widgets:
+            w.bind("<Button-1>", on_press)
+            w.bind("<B1-Motion>", on_motion)
+            w.bind("<ButtonRelease-1>", on_release)
 
         # Thin separator under header
         tk.Frame(frame, bg=BORDER_COLOR, height=1).pack(fill="x", padx=PAD_SECTION, pady=(6, 8))
@@ -326,19 +482,27 @@ class YTYoinkApp(tk.Tk):
         self._settings_win = None
 
         def title_check(row, text, var, cmd=None):
-            tk.Checkbutton(
+            cb = tk.Checkbutton(
                 row, text=text, variable=var, font=FONT_SMALL,
                 bg=BG_MAIN, fg=FG_LABEL,
                 activebackground=BG_MAIN, activeforeground=FG_TEXT,
                 selectcolor=BG_INPUT, highlightthickness=0, bd=0,
                 command=cmd,
-            ).pack(side="right")
+            )
+            cb.pack(side="right")
+            return cb
 
         # ---- URL Input ----
         url_outer, url_inner = make_card(frame, "URL")
         url_outer.pack(fill="x", padx=PAD_SECTION, pady=PAD_Y)
-        title_check(url_outer.title_row, "Turbo", self._turbo_var,
-                    self._on_turbo_change)
+        self._turbo_cb = title_check(url_outer.title_row, "Turbo",
+                                     self._turbo_var, self._on_turbo_change)
+        self._make_tooltip(
+            self._turbo_cb,
+            "Turbo: fetching a URL downloads it immediately,\n"
+            "skipping the preview step. Uses your preferred\n"
+            "metadata and artwork sources from Settings (⚙).",
+        )
 
         url_row = tk.Frame(url_inner, bg=BG_SECTION)
         url_row.pack(fill="x")
@@ -401,8 +565,15 @@ class YTYoinkApp(tk.Tk):
         meta_outer, meta_inner = make_card(frame, "Metadata  (check to override)")
         meta_outer.pack(fill="x", padx=PAD_SECTION, pady=PAD_Y)
         self._meta_outer = meta_outer
-        title_check(meta_outer.title_row, "Keep overrides on fetch",
-                    self._keep_overrides_var)
+        self._keep_overrides_cb = title_check(
+            meta_outer.title_row, "Keep overrides on fetch",
+            self._keep_overrides_var)
+        self._make_tooltip(
+            self._keep_overrides_cb,
+            "Keeps your checked override fields filled in for the\n"
+            "next fetch — useful when downloading several tracks\n"
+            "that share the same artist, album, or year.",
+        )
 
         # Metadata source toggle (shown only when iTunes data is available)
         self._meta_source_var = tk.StringVar(value=self.config.metadata_source)
@@ -849,6 +1020,45 @@ class YTYoinkApp(tk.Tk):
     def _on_turbo_change(self):
         self.config.turbo_mode = self._turbo_var.get()
         self.config.save()
+
+    def _make_tooltip(self, widget, text: str):
+        """Show a themed tooltip under the widget after a short hover delay."""
+        state = {"win": None, "job": None}
+
+        def show():
+            state["job"] = None
+            if state["win"] is not None:
+                return
+            tw = tk.Toplevel(self)
+            tw.wm_overrideredirect(True)
+            tk.Label(
+                tw, text=text, font=FONT_SMALL,
+                bg=BG_SECTION, fg=FG_TEXT, justify="left",
+                highlightbackground=BORDER_COLOR, highlightcolor=BORDER_COLOR,
+                highlightthickness=1, padx=8, pady=5,
+            ).pack()
+            tw.update_idletasks()
+            # Right-align to the widget so it never spills past the window
+            x = widget.winfo_rootx() + widget.winfo_width() - tw.winfo_reqwidth()
+            x = max(x, self.winfo_rootx() + 8)
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            tw.wm_geometry(f"+{x}+{y}")
+            state["win"] = tw
+
+        def on_enter(event):
+            if state["job"] is None and state["win"] is None:
+                state["job"] = self.after(450, show)
+
+        def on_leave(event):
+            if state["job"]:
+                self.after_cancel(state["job"])
+                state["job"] = None
+            if state["win"] is not None:
+                state["win"].destroy()
+                state["win"] = None
+
+        widget.bind("<Enter>", on_enter)
+        widget.bind("<Leave>", on_leave)
 
     def _open_settings(self):
         """Open (or focus) the settings window with the set-once preferences."""
