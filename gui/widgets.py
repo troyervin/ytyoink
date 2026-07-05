@@ -251,7 +251,7 @@ class CheckboxEntry(tk.Frame):
 class ImagePreview(tk.Frame):
     """Displays a rounded-corner image preview with a label underneath."""
 
-    ZOOM_SIZE = 320
+    ZOOM_SIZE = 380
 
     def __init__(self, parent, size: tuple[int, int] = (140, 140), **kwargs):
         super().__init__(parent, bg=BG_SECTION, **kwargs)
@@ -365,6 +365,20 @@ class ImagePreview(tk.Frame):
         self._canvas.config(image="", text="")
         self._set_label("")
 
+    def set_display_size(self, size: int) -> None:
+        """Dynamically resize the tile (adaptive layout). Re-renders from
+        the original-resolution image so enlarged tiles stay sharp."""
+        if size == self._size[0]:
+            return
+        self._size = (size, size)
+        if not HAS_PIL:
+            return
+        if self._pil_full is not None:
+            self._pil_base = self._pil_full.resize(self._size, Image.LANCZOS)
+        elif self._pil_base is not None:
+            self._pil_base = Image.new("RGBA", self._size, BG_INPUT)
+        self._render_tile()
+
     # ---- Hover zoom: larger preview above the tile ----
 
     def _schedule_zoom(self, event=None):
@@ -374,11 +388,46 @@ class ImagePreview(tk.Frame):
             self.after_cancel(self._zoom_job)
         self._zoom_job = self.after(350, self._show_zoom)
 
+    def _pick_zoom_placement(self):
+        """Choose popup size and position: above or below the tile (shrunk
+        to fit if needed), or beside it as a last resort. The popup never
+        overlaps the tile — overlap would fire <Leave> and dismiss it —
+        and never runs off the screen."""
+        # Always noticeably larger than the tile itself (tiles grow when
+        # the window is big), capped so it stays a preview, not a takeover
+        size = min(max(self.ZOOM_SIZE, int(self._size[0] * 1.35)), 560)
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        tile_top = self.winfo_rooty()
+        tile_bottom = tile_top + self.winfo_height()
+        space_above = tile_top - 16
+        space_below = screen_h - tile_bottom - 16
+
+        best = max(space_above, space_below)
+        if best >= 220:
+            size = min(size, best)
+            x = self.winfo_rootx() + self.winfo_width() // 2 - size // 2
+            x = max(8, min(x, screen_w - size - 8))
+            if space_above >= space_below:
+                y = tile_top - size - 10
+            else:
+                y = tile_bottom + 10
+        else:
+            # Cramped vertically — place beside the tile instead
+            tile_right = self.winfo_rootx() + self.winfo_width()
+            if screen_w - tile_right - 16 >= size:
+                x = tile_right + 12
+            else:
+                x = max(8, self.winfo_rootx() - size - 12)
+            y = tile_top + self.winfo_height() // 2 - size // 2
+            y = max(8, min(y, screen_h - size - 8))
+        return size, x, y
+
     def _show_zoom(self):
         self._zoom_job = None
         if self._pil_full is None or self._zoom_win is not None:
             return
-        size = self.ZOOM_SIZE
+        size, x, y = self._pick_zoom_placement()
         img = self._pil_full.resize((size, size), Image.LANCZOS).convert("RGBA")
         radius = 14
         mask = Image.new("L", (size * _SS, size * _SS), 0)
@@ -402,15 +451,6 @@ class ImagePreview(tk.Frame):
         except tk.TclError:
             pass
         tk.Label(tw, image=self._zoom_photo, bg=key, bd=0).pack()
-
-        # Above the tile when there's room, otherwise below — never over it,
-        # or Enter/Leave would flicker.
-        screen_w = self.winfo_screenwidth()
-        x = self.winfo_rootx() + self.winfo_width() // 2 - size // 2
-        x = max(8, min(x, screen_w - size - 8))
-        y = self.winfo_rooty() - size - 10
-        if y < 5:
-            y = self.winfo_rooty() + self.winfo_height() + 10
         tw.wm_geometry(f"+{x}+{y}")
         self._zoom_win = tw
 

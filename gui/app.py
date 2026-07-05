@@ -113,6 +113,36 @@ class YTYoinkApp(tk.Tk):
     def _toggle_maximize(self):
         self.state("normal" if self.state() == "zoomed" else "zoomed")
 
+    def _clamp_zoomed_to_workarea(self):
+        """Caption-stripped windows maximize to the FULL screen, covering
+        the taskbar — resize the zoomed window to the monitor work area."""
+        if self.state() != "zoomed":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD),
+                            ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT),
+                            ("dwFlags", wintypes.DWORD)]
+
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(self.winfo_id())
+            monitor = user32.MonitorFromWindow(hwnd, 2)  # nearest monitor
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if not user32.GetMonitorInfoW(monitor, ctypes.byref(mi)):
+                return
+            rw = mi.rcWork
+            # SWP_NOZORDER | SWP_NOACTIVATE
+            user32.SetWindowPos(hwnd, 0, rw.left, rw.top,
+                                rw.right - rw.left, rw.bottom - rw.top,
+                                0x0004 | 0x0010)
+        except Exception:
+            pass
+
     def _force_redraw(self):
         """Repaint and re-sync layout after a zoom transition.
 
@@ -121,10 +151,17 @@ class YTYoinkApp(tk.Tk):
         nudge forces a full re-layout, then a native repaint cleans up.
         """
         try:
-            w, h = self.winfo_width(), self.winfo_height()
-            if self.state() == "normal":
+            def nudge():
+                # Read the size fresh — during the restore animation the
+                # height is transient, and pinning it via geometry() would
+                # freeze the window at a wrong (too tall) size.
+                if self.state() != "normal":
+                    return
+                w, h = self.winfo_width(), self.winfo_height()
                 self.geometry(f"{w}x{h + 1}")
                 self.after(30, lambda: self.geometry(f"{w}x{h}"))
+
+            self.after(250, nudge)
             # Re-sync the scroll canvas (its embedded frame is what loses
             # its pixels), then force a native repaint of everything else.
             self.after(80, self._sync_canvas)
@@ -229,19 +266,30 @@ class YTYoinkApp(tk.Tk):
             glyph = "" if self.state() == "zoomed" else ""
             if self._max_btn.cget("text") != glyph:
                 self._max_btn.config(text=glyph)
+                # Keep the maximized window off the taskbar area
+                self.after(20, self._clamp_zoomed_to_workarea)
                 # With the caption stripped, zoom transitions leave stale
                 # pixels behind - force a full native repaint.
                 self.after(50, self._force_redraw)
+                # Final settle pass: earlier evaluations can race the
+                # transition animation and read a transient height.
+                self.after(700, self._update_log_visibility)
         if self._resize_job:
             self.after_cancel(self._resize_job)
         self._resize_job = self.after(60, self._update_log_visibility)
 
-    def _update_log_visibility(self):
-        """Show the command-window log only when the window has spare room.
+    # Adaptive space budget: spare height goes to the log first (up to the
+    # reserve), then into growing the artwork tiles, then back to the log.
+    LOG_RESERVE = 160
+    TILE_MAX = 300
 
-        Spare space is always measured against the *compact* layout (status
-        line, no log) so showing/hiding the log can't oscillate. The window
-        min-height tracks the compact layout, keeping content unscrollable.
+    def _update_log_visibility(self):
+        """Distribute spare window height: log, then artwork tile growth.
+
+        Spare space is always measured against the *compact baseline*
+        (status line, no log, base-size tiles) so nothing can oscillate.
+        The window min-height tracks that baseline, keeping the content
+        unscrollable while still allowing shrink-back.
         """
         self._resize_job = None
         sb = self._status_bar
@@ -251,13 +299,30 @@ class YTYoinkApp(tk.Tk):
             compact_footer = footer_req - sb.log_min_req() + sb.line_req()
         else:
             compact_footer = footer_req
-        spare = self.winfo_height() - content_h - compact_footer
+        # Baseline content: as if tiles were at their base size
+        base_content = content_h - (self._tile_size - self._tile_base)
+        spare = self.winfo_height() - base_content - compact_footer
+
         if sb.log_visible and spare < 60:
             sb.set_log_visible(False)
         elif not sb.log_visible and spare > 140:
             sb.set_log_visible(True)
+
+        # Grow tiles with whatever remains after the log's reserved slice
+        if sb.log_visible:
+            tile_extra = max(0, spare - self.LOG_RESERVE)
+        else:
+            tile_extra = 0
+        target = min(self._tile_base + tile_extra, self.TILE_MAX)
+        if abs(target - self._tile_size) >= 8 or \
+                (target == self._tile_base and self._tile_size != target):
+            self._tile_size = target
+            for tile in (self._itunes_tile, self._yt_tile,
+                         self._custom_tile, self._none_tile):
+                tile.set_display_size(target)
+
         self.minsize(WINDOW_MIN_WIDTH,
-                     min(content_h + compact_footer,
+                     min(base_content + compact_footer,
                          self.winfo_screenheight() - 120))
 
     def _build_window(self):
@@ -441,13 +506,22 @@ class YTYoinkApp(tk.Tk):
             # Enter the native move loop only after real movement — starting
             # it on the bare click causes a visible hiccup while Tk's
             # implicit grab and the loop fight over the pointer.
-            if self._header_press is None or self.state() == "zoomed":
+            if self._header_press is None:
                 return
             dx = abs(event.x_root - self._header_press[0])
             dy = abs(event.y_root - self._header_press[1])
             if dx + dy < 4:
                 return
             self._header_press = None
+            if self.state() == "zoomed":
+                # Like a real title bar: dragging a maximized window
+                # restores it under the cursor, then the drag continues.
+                xfrac = event.x_root / max(self.winfo_width(), 1)
+                self.state("normal")
+                self.update_idletasks()
+                new_x = int(event.x_root - xfrac * self.winfo_width())
+                new_y = max(event.y_root - 24, 0)
+                self.geometry(f"+{new_x}+{new_y}")
             try:
                 import ctypes
                 hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
@@ -620,6 +694,8 @@ class YTYoinkApp(tk.Tk):
         self._cover_preview_frame.pack(fill="x", pady=(PAD_Y, 0))
 
         self._cover_choice_var = tk.StringVar(value="itunes")
+        self._tile_base = COVER_PREVIEW_SIZE[0]
+        self._tile_size = self._tile_base
 
         self._covers_row = tk.Frame(self._cover_preview_frame, bg=BG_SECTION)
         self._covers_row.pack(pady=(2, 0))
