@@ -71,6 +71,10 @@ class RoundButton(tk.Canvas):
         self._redraw()
 
     def configure(self, cnf=None, **kw):
+        if isinstance(cnf, str):
+            return super().configure(cnf)  # option query form
+        if cnf is None and not kw:
+            return super().configure()     # full option dict form
         if cnf:
             kw.update(cnf)
         state = kw.pop("state", None)
@@ -272,6 +276,9 @@ class ImagePreview(tk.Frame):
         self._canvas.bind("<Enter>", self._schedule_zoom)
         self._canvas.bind("<Leave>", self._hide_zoom)
         self._canvas.bind("<Button-1>", self._hide_zoom)
+        # A tile destroyed while a zoom is scheduled/open must clean up,
+        # or the after-callback fires on a dead widget
+        self._canvas.bind("<Destroy>", self._hide_zoom, add="+")
 
         self._label = tk.Label(
             self,
@@ -388,26 +395,51 @@ class ImagePreview(tk.Frame):
             self.after_cancel(self._zoom_job)
         self._zoom_job = self.after(350, self._show_zoom)
 
+    def _monitor_bounds(self):
+        """Work area of the monitor containing this widget. winfo_screen*
+        only covers the primary monitor, which put the popup on the wrong
+        screen for multi-monitor setups."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD),
+                            ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT),
+                            ("dwFlags", wintypes.DWORD)]
+
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetParent(self.winfo_toplevel().winfo_id())
+            monitor = user32.MonitorFromWindow(hwnd, 2)  # nearest monitor
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if user32.GetMonitorInfoW(monitor, ctypes.byref(mi)):
+                rw = mi.rcWork
+                return rw.left, rw.top, rw.right, rw.bottom
+        except Exception:
+            pass
+        return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
+
     def _pick_zoom_placement(self):
         """Choose popup size and position: above or below the tile (shrunk
         to fit if needed), or beside it as a last resort. The popup never
         overlaps the tile — overlap would fire <Leave> and dismiss it —
-        and never runs off the screen."""
+        and never leaves the tile's monitor."""
         # Always noticeably larger than the tile itself (tiles grow when
         # the window is big), capped so it stays a preview, not a takeover
         size = min(max(self.ZOOM_SIZE, int(self._size[0] * 1.35)), 560)
-        screen_w = self.winfo_screenwidth()
-        screen_h = self.winfo_screenheight()
+        left, top, right, bottom = self._monitor_bounds()
         tile_top = self.winfo_rooty()
         tile_bottom = tile_top + self.winfo_height()
-        space_above = tile_top - 16
-        space_below = screen_h - tile_bottom - 16
+        space_above = tile_top - top - 16
+        space_below = bottom - tile_bottom - 16
 
         best = max(space_above, space_below)
         if best >= 220:
             size = min(size, best)
             x = self.winfo_rootx() + self.winfo_width() // 2 - size // 2
-            x = max(8, min(x, screen_w - size - 8))
+            x = max(left + 8, min(x, right - size - 8))
             if space_above >= space_below:
                 y = tile_top - size - 10
             else:
@@ -415,12 +447,12 @@ class ImagePreview(tk.Frame):
         else:
             # Cramped vertically — place beside the tile instead
             tile_right = self.winfo_rootx() + self.winfo_width()
-            if screen_w - tile_right - 16 >= size:
+            if right - tile_right - 16 >= size:
                 x = tile_right + 12
             else:
-                x = max(8, self.winfo_rootx() - size - 12)
+                x = max(left + 8, self.winfo_rootx() - size - 12)
             y = tile_top + self.winfo_height() // 2 - size // 2
-            y = max(8, min(y, screen_h - size - 8))
+            y = max(top + 8, min(y, bottom - size - 8))
         return size, x, y
 
     def _show_zoom(self):
@@ -456,10 +488,16 @@ class ImagePreview(tk.Frame):
 
     def _hide_zoom(self, event=None):
         if self._zoom_job:
-            self.after_cancel(self._zoom_job)
+            try:
+                self.after_cancel(self._zoom_job)
+            except Exception:
+                pass  # widget mid-destruction
             self._zoom_job = None
         if self._zoom_win is not None:
-            self._zoom_win.destroy()
+            try:
+                self._zoom_win.destroy()
+            except Exception:
+                pass
             self._zoom_win = None
             self._zoom_photo = None
 

@@ -74,7 +74,10 @@ def cleanup_stale_temp() -> int:
                 is_empty = len(contents) == 0 or (
                     len(contents) == 1 and contents[0].name == ".lock"
                 )
-                if is_empty or entry.stat().st_mtime < cutoff:
+                mtime = entry.stat().st_mtime
+                # 60s grace: another instance may have just created the
+                # folder and not written its lock file yet
+                if (is_empty and mtime < time.time() - 60) or mtime < cutoff:
                     shutil.rmtree(entry.path, ignore_errors=True)
                     removed += 1
             except Exception:
@@ -403,11 +406,23 @@ class DownloadPipeline:
                 break
 
             if attempt < max_attempts and "403" in "\n".join(output_lines):
+                self._check_cancel()
+                # Clear partial media from this attempt so the retry can't
+                # mistake it for a completed download (--no-part means no
+                # .part suffix protects us)
+                try:
+                    for entry in os.scandir(run_temp):
+                        ext = os.path.splitext(entry.name)[1].lower()
+                        if entry.is_file() and ext in AUDIO_EXTENSIONS:
+                            os.remove(entry.path)
+                except OSError:
+                    pass
                 self._status(
                     f"YouTube rejected the download (403), "
                     f"retrying ({attempt + 1}/{max_attempts})..."
                 )
                 time.sleep(2)
+                self._check_cancel()
                 continue
 
             raise RuntimeError(
@@ -711,7 +726,7 @@ class DownloadPipeline:
             try:
                 subprocess.run(
                     [
-                        "ffmpeg", "-y", "-v", "quiet",
+                        "ffmpeg", "-y", "-v", "error",
                         "-i", cover_file,
                         "-vf", "crop='min(iw,ih)':'min(iw,ih)'",
                         "-frames:v", "1", "-update", "1",
@@ -741,7 +756,7 @@ class DownloadPipeline:
             self._encode_opus(raw_audio, png_path, has_cover, output_path,
                               tags, duration)
             return
-        ff_args = ["ffmpeg", "-y", "-v", "quiet", "-i", raw_audio]
+        ff_args = ["ffmpeg", "-y", "-v", "error", "-i", raw_audio]
 
         if has_cover:
             ff_args += ["-i", png_path]
@@ -770,9 +785,23 @@ class DownloadPipeline:
             if value or key == "comment":
                 ff_args += ["-metadata", f"{key}={value}"]
 
-        rc, err = self._run_ffmpeg(ff_args, output_path, duration)
+        try:
+            rc, err = self._run_ffmpeg(ff_args, output_path, duration)
+        except CancelledError:
+            self._remove_partial(output_path)
+            raise
         if rc != 0:
+            self._remove_partial(output_path)
             raise RuntimeError(f"ffmpeg failed: {err[:500]}")
+
+    @staticmethod
+    def _remove_partial(path: str) -> None:
+        """Delete a partially-written output file after a failed encode."""
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
 
     def _encode_opus(self, raw_audio, png_path, has_cover, output_path,
                      tags, duration) -> None:
@@ -794,14 +823,21 @@ class DownloadPipeline:
         with open(meta_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
-        base = ["ffmpeg", "-y", "-v", "quiet", "-i", raw_audio,
+        base = ["ffmpeg", "-y", "-v", "error", "-i", raw_audio,
                 "-f", "ffmetadata", "-i", meta_path,
                 "-map_metadata", "1", "-map", "0:a:0"]
-        rc, err = self._run_ffmpeg(base + ["-c:a", "copy"], output_path, duration)
+        try:
+            rc, err = self._run_ffmpeg(base + ["-c:a", "copy"],
+                                       output_path, duration)
+            if rc != 0:
+                rc, err = self._run_ffmpeg(
+                    base + ["-c:a", "libopus", "-b:a", "192k"],
+                    output_path, duration)
+        except CancelledError:
+            self._remove_partial(output_path)
+            raise
         if rc != 0:
-            rc, err = self._run_ffmpeg(
-                base + ["-c:a", "libopus", "-b:a", "192k"], output_path, duration)
-        if rc != 0:
+            self._remove_partial(output_path)
             raise RuntimeError(f"ffmpeg failed: {err[:500]}")
 
         # ffmpeg's ogg muxer drops METADATA_BLOCK_PICTURE, so the cover

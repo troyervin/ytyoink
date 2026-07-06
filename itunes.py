@@ -119,14 +119,136 @@ def _score_results(results: list[dict], want_artist: str, want_title: str) -> It
     )
 
 
-def search_itunes_candidates(artist: str, title: str,
-                             limit: int = 6) -> list["ItunesMatch"]:
+def _result_to_match(r: dict, artist: str, title: str) -> ItunesMatch | None:
+    """Score a single API result against the wanted artist/title."""
+    m1 = _score_results([r], artist, title)
+    m2 = _score_results([r], title, artist) if artist and title else None
+    if m2 and (not m1 or m2.score > m1.score):
+        return m2
+    return m1
+
+
+_APPLE_URL_RE = re.compile(
+    r"music\.apple\.com/[a-z\-]+/(?:album|song)/[^/]+/(\d+)(?:\?i=(\d+))?",
+    re.IGNORECASE)
+
+
+def lookup_apple_music(url_or_id: str, artist: str = "",
+                       title: str = "") -> list["ItunesMatch"]:
+    """Resolve a music.apple.com link (or numeric id) via the lookup API.
+
+    Reaches Apple Music streaming-only tracks that the iTunes Store
+    search index doesn't contain at all.
+    """
+    m = _APPLE_URL_RE.search(url_or_id or "")
+    if m:
+        lookup_id = m.group(2) or m.group(1)
+    elif (url_or_id or "").strip().isdigit():
+        lookup_id = url_or_id.strip()
+    else:
+        return []
+    try:
+        resp = requests.get(
+            "https://itunes.apple.com/lookup?"
+            + urllib.parse.urlencode({"id": lookup_id, "entity": "song"}),
+            timeout=8)
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+    except Exception:
+        return []
+    out = []
+    for r in results:
+        if r.get("wrapperType") != "track":
+            continue
+        match = _result_to_match(r, artist, title)
+        if match:
+            out.append(match)
+    return out
+
+
+def _apple_music_web_track_ids(term: str, limit: int = 5) -> list[str]:
+    """Scrape Apple Music's web search for track ids — the fallback that
+    finds streaming-only songs missing from the store search API."""
+    url = ("https://music.apple.com/us/search?"
+           + urllib.parse.urlencode({"term": term}))
+    html = requests.get(url, timeout=10,
+                        headers={"User-Agent": "Mozilla/5.0"}).text
+    ids: list[str] = []
+    for album_id, track_id in re.findall(r'/album/[^/"]+/(\d+)\?i=(\d+)', html):
+        if track_id not in ids:
+            ids.append(track_id)
+        if len(ids) >= limit:
+            break
+    return ids
+
+
+def search_itunes_album_tracks(album: str, artist: str = "",
+                               limit: int = 30) -> list["ItunesMatch"]:
+    """Find an album by name (optionally by artist) and return its tracks
+    in album order — e.g. everything on 'The Blueprint' by Jay-Z."""
+    term = f"{artist} {album}".strip()
+    if not term:
+        return []
+    try:
+        resp = requests.get(
+            "https://itunes.apple.com/search?"
+            + urllib.parse.urlencode({"term": term, "entity": "album",
+                                      "limit": "10"}),
+            timeout=8)
+        resp.raise_for_status()
+        albums = resp.json().get("results", [])
+    except Exception:
+        return []
+
+    want_album = normalize_meta_text(album)
+    want_artist = normalize_meta_text(artist)
+
+    def album_score(a):
+        name = normalize_meta_text(a.get("collectionName", ""))
+        art = normalize_meta_text(a.get("artistName", ""))
+        score = 0
+        if want_album and want_album == name:
+            score += 6
+        elif want_album and want_album in name:
+            score += 3
+        if want_artist and (want_artist in art or art in want_artist):
+            score += 4
+        return score
+
+    albums.sort(key=album_score, reverse=True)
+    if not albums or album_score(albums[0]) <= 0:
+        return []
+    collection_id = albums[0].get("collectionId")
+    if not collection_id:
+        return []
+    try:
+        resp = requests.get(
+            "https://itunes.apple.com/lookup?"
+            + urllib.parse.urlencode({"id": collection_id, "entity": "song",
+                                      "limit": str(limit)}),
+            timeout=8)
+        results = resp.json().get("results", [])
+    except Exception:
+        return []
+    out = []
+    for r in results:
+        if r.get("wrapperType") != "track":
+            continue
+        match = _result_to_match(r, artist, "")
+        if match:
+            out.append(match)
+    return out
+
+
+def search_itunes_candidates(artist: str, title: str, limit: int = 6,
+                             term: str | None = None) -> list["ItunesMatch"]:
     """Return the top-scoring iTunes matches (deduped), best first.
 
     Used by the "wrong match?" picker so the user can choose between
-    e.g. the single, the album version, and remixes.
+    e.g. the single, the album version, and remixes. `term` overrides the
+    search text (user-edited query) while artist/title still drive scoring.
     """
-    term = f"{artist or ''} {title or ''}".strip()
+    term = (term or f"{artist or ''} {title or ''}").strip()
     if not term:
         return []
 
@@ -158,6 +280,46 @@ def search_itunes_candidates(artist: str, title: str,
         candidates.append(m)
 
     candidates.sort(key=lambda m: m.score, reverse=True)
+
+    # If nothing matched the wanted title BY THE WANTED ARTIST, the song may
+    # be streaming-only (absent from the store search index) — check Apple
+    # Music's web search and resolve the ids via the lookup API.
+    want_t = normalize_meta_text(title or "")
+    want_a = normalize_meta_text(artist or "")
+
+    def _matches_want(c):
+        if not want_t or want_t not in normalize_meta_text(c.song):
+            return False
+        if not want_a:
+            return True
+        cand_a = normalize_meta_text(c.artist)
+        return want_a in cand_a or cand_a in want_a
+
+    if not any(_matches_want(c) for c in candidates):
+        try:
+            ids = _apple_music_web_track_ids(term)
+            if ids:
+                resp = requests.get(
+                    "https://itunes.apple.com/lookup?"
+                    + urllib.parse.urlencode({"id": ",".join(ids),
+                                              "entity": "song"}),
+                    timeout=8)
+                extra = []
+                for r in resp.json().get("results", []):
+                    if r.get("wrapperType") != "track":
+                        continue
+                    match = _result_to_match(r, artist, title)
+                    if not match:
+                        continue
+                    key = (match.song.lower(), match.artist.lower(),
+                           match.album.lower())
+                    if key not in seen:
+                        seen.add(key)
+                        extra.append(match)
+                candidates = extra + candidates
+        except Exception:
+            pass
+
     return candidates[:limit]
 
 

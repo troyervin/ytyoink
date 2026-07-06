@@ -48,6 +48,12 @@ class AppConfig:
             data = {}
 
         cfg._migrate(data)
+        # Hand-edited configs with wrong-typed values must not crash
+        # startup: keep only string values for string fields
+        for key in ("DownloadFolder", "Format", "CoverSource",
+                    "MetadataSource"):
+            if data.get(key) is not None and not isinstance(data[key], str):
+                data[key] = None
 
         cfg.download_folder = data.get("DownloadFolder") or None
         cfg.format = (data.get("Format") or "m4a").lower()

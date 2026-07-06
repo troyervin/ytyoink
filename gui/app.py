@@ -83,6 +83,19 @@ class YTYoinkApp(tk.Tk):
         self.after(10, self._strip_native_titlebar)
         self.after(50, self._enforce_min_height)
 
+    def destroy(self):
+        # Tidy: remove the session's clipboard-paste cover temp file, if any
+        # (browsed cover files are the user's own and are never touched)
+        try:
+            import tempfile
+            paste_png = os.path.join(tempfile.gettempdir(),
+                                     "ytyoink_custom_cover.png")
+            if os.path.isfile(paste_png):
+                os.remove(paste_png)
+        except Exception:
+            pass
+        super().destroy()
+
     def _strip_native_titlebar(self, window=None):
         """Remove the Windows caption bar (of the main window or a popup).
         Keeps the resize borders, the taskbar entry, and Win+arrow snapping,
@@ -1014,6 +1027,9 @@ class YTYoinkApp(tk.Tk):
             self._status_bar.append("Playlist parameters stripped; downloading single video only.", "dim")
         self._current_url = normalized
 
+        # A previous Cancel must not poison this fresh fetch
+        self.pipeline.reset_cancel()
+        self._show_skip(False)
         self._set_ui_state("fetching")
         if not self._queue_running:
             self._status_bar.clear()
@@ -1039,6 +1055,12 @@ class YTYoinkApp(tk.Tk):
                 str(self._cancel_btn.cget("state")) == "disabled":
             self._status_bar.append("Fetch stopped unexpectedly.", "error")
             self._set_ui_state("idle")
+            if self._queue_running:
+                if self._queue:
+                    self.after(600, self._next_in_queue)
+                else:
+                    self._finish_queue(
+                        "Queue finished (last video failed).", "warning")
 
     def _fetch_worker(self, url: str):
         try:
@@ -1351,22 +1373,85 @@ class YTYoinkApp(tk.Tk):
 
         def wheel(event):
             canvas.yview_scroll(int(-event.delta / 120), "units")
+            return "break"
 
-        win = wrap.winfo_toplevel()
-        self.bind_all("<MouseWheel>", wheel)
-        win.bind("<Destroy>", lambda e: self.bind_all(
-            "<MouseWheel>", self._on_mousewheel) if e.widget is win else None)
+        # Bind on the popup toplevel (every child's bindtags include it) —
+        # a global bind_all would let popups steal each other's wheel and
+        # break the main window's handler on out-of-order closes
+        wrap.winfo_toplevel().bind("<MouseWheel>", wheel, add="+")
         return wrap, inner
 
     def _reveal_file(self, path: str):
-        """Show a file in Explorer; falls back to opening its folder."""
+        """Show a file in Explorer. Files dropped into 'Automatically Add
+        to iTunes' get moved into the library tree — hunt them down there."""
         if not path:
             return
         path = os.path.normpath(path)
         if os.path.isfile(path):
             subprocess.run(["explorer", "/select," + path])
-        elif os.path.isdir(os.path.dirname(path)):
-            os.startfile(os.path.dirname(path))
+            return
+        folder = os.path.dirname(path)
+        if "automatically add to itunes" in folder.lower():
+            self._locate_in_itunes_library(path)
+        elif os.path.isdir(folder):
+            os.startfile(folder)
+
+    def _locate_in_itunes_library(self, orig_path: str):
+        """iTunes moves auto-added files to Music/<Artist>/<Album>/ and
+        usually renames them to just the title — search the library for
+        the real location and reveal it."""
+        self._status_bar.append(
+            "iTunes moved this file into the library. Searching...", "dim")
+        fname = os.path.basename(orig_path)
+        stem, ext = os.path.splitext(fname)
+        title_part = stem.split(" - ", 1)[1].strip() if " - " in stem else stem
+        media_root = os.path.dirname(os.path.dirname(orig_path))
+
+        def worker():
+            target_full = fname.lower()
+            target_title = (title_part + ext).lower()
+            found = fallback = None
+            scanned = 0
+            roots = [os.path.join(media_root, "Music"), media_root]
+            for root in roots:
+                if not os.path.isdir(root) or found:
+                    continue
+                for dirpath, _dirs, filenames in os.walk(root):
+                    for fn in filenames:
+                        scanned += 1
+                        low = fn.lower()
+                        if low == target_full:
+                            found = os.path.join(dirpath, fn)
+                            break
+                        if fallback is None and (
+                                low == target_title
+                                or low.endswith(" " + target_title)):
+                            # iTunes rename: "Title.ext" or "1-01 Title.ext"
+                            fallback = os.path.join(dirpath, fn)
+                    if found or scanned > 200000:
+                        break
+
+            hit = found or fallback
+
+            def done():
+                if hit:
+                    self._status_bar.append(
+                        f"Found it: {os.path.basename(hit)}", "dim")
+                    subprocess.run(["explorer",
+                                    "/select," + os.path.normpath(hit)])
+                else:
+                    self._status_bar.append(
+                        "Could not find it in the iTunes library (it may "
+                        "have been renamed). Opening the library folder.",
+                        "warning")
+                    music = os.path.join(media_root, "Music")
+                    target = music if os.path.isdir(music) else media_root
+                    if os.path.isdir(target):
+                        os.startfile(target)
+
+            self.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---- YouTube search popup ----
 
@@ -1393,6 +1478,10 @@ class YTYoinkApp(tk.Tk):
                 child.config(bg=color)
 
         def pick(url):
+            if self._ui_state in ("fetching", "downloading"):
+                info.config(text="Busy with another download. Try again in a moment.",
+                            fg=FG_WARN)
+                return
             win.destroy()
             self._url_entry.config(state="normal")
             self._url_entry.delete(0, tk.END)
@@ -1464,26 +1553,51 @@ class YTYoinkApp(tk.Tk):
         win, body = self._make_popup("Choose iTunes match")
         self._match_win = win
 
+        # Editable query — when the auto-search misses, refine it yourself
+        search_row = tk.Frame(body, bg=BG_MAIN)
+        search_row.pack(fill="x", pady=(0, 6))
+        query_field = RoundField(search_row, height=30)
+        query_field.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        query_field.config(width=330)
+        query_field.entry.insert(
+            0, f"{self._yt_meta.get('artist', '')} "
+               f"{self._yt_meta.get('title', '')}".strip())
+
+        # Live filters — narrow whatever the search returned
+        filters_row = tk.Frame(body, bg=BG_MAIN)
+        filters_row.pack(fill="x", pady=(0, 4))
+        filter_entries = {}
+        for name, expand in (("Artist", True), ("Album", True), ("Year", False)):
+            cell = tk.Frame(filters_row, bg=BG_MAIN)
+            cell.pack(side="left", fill="x", expand=expand,
+                      padx=(0, 6) if expand else 0)
+            tk.Label(cell, text=name, font=FONT_SMALL, bg=BG_MAIN,
+                     fg=FG_DIM, anchor="w").pack(fill="x")
+            field = RoundField(cell, height=26)
+            if not expand:
+                field.config(width=70)
+            field.pack(fill="x")
+            filter_entries[name.lower()] = field.entry
+
         info = tk.Label(body, text="Searching iTunes...", font=FONT_SMALL,
                         bg=BG_MAIN, fg=FG_DIM, anchor="w")
         info.pack(fill="x", pady=(0, 4))
-        results = tk.Frame(body, bg=BG_MAIN)
-        results.pack(fill="both", expand=True)
+        results_wrap, results = self._scroll_area(body, height=330)
+        results_wrap.pack(fill="both", expand=True)
 
         def set_row_bg(frame, color):
             frame.config(bg=color)
             for child in frame.winfo_children():
                 child.config(bg=color)
 
+        all_cands = []
         art_labels = []
+        art_cache = {}
 
-        def populate(cands):
-            if not win.winfo_exists():
-                return
-            if not cands:
-                info.config(text="No iTunes matches found.", fg=FG_WARN)
-                return
-            info.config(text="Click the correct song:")
+        def render(cands):
+            for child in results.winfo_children():
+                child.destroy()
+            art_labels.clear()
             for m in cands:
                 rowf = tk.Frame(results, bg=BG_SECTION, padx=8, pady=6,
                                 highlightbackground=BORDER_COLOR,
@@ -1509,15 +1623,56 @@ class YTYoinkApp(tk.Tk):
                     w.bind("<Leave>", lambda e, f=rowf: set_row_bg(f, BG_SECTION))
             threading.Thread(target=load_art, daemon=True).start()
 
+        def fold(s):
+            # Diacritic-insensitive compare: Apple styles names like
+            # JAŸ-Z and Beyoncé, which plain .lower() can't match
+            import unicodedata
+            return "".join(ch for ch in unicodedata.normalize("NFKD", s or "")
+                           if not unicodedata.combining(ch)).lower()
+
+        def apply_filters(*_):
+            fa = fold(filter_entries["artist"].get().strip())
+            fb = fold(filter_entries["album"].get().strip())
+            fy = filter_entries["year"].get().strip()
+            subset = [c for c in all_cands
+                      if (not fa or fa in fold(c.artist))
+                      and (not fb or fb in fold(c.album))
+                      and (not fy or fy in (c.year or ""))]
+            render(subset)
+            if all_cands:
+                if len(subset) != len(all_cands):
+                    info.config(text=f"{len(subset)} of {len(all_cands)} "
+                                     "match your filters:", fg=FG_DIM)
+                else:
+                    info.config(text="Click the correct song:", fg=FG_DIM)
+
+        for entry in filter_entries.values():
+            entry.bind("<KeyRelease>", apply_filters)
+
+        def populate(cands):
+            if not win.winfo_exists():
+                return
+            go.config(state="normal")
+            all_cands[:] = cands
+            if not cands:
+                info.config(text="No iTunes matches found. Try different "
+                                 "search words above.", fg=FG_WARN)
+                render([])
+                return
+            apply_filters()
+
         def load_art():
             import io
-            for label, url in art_labels:
+            for label, url in list(art_labels):
                 if not url:
                     continue
-                data = self.pipeline.download_cover_bytes(
-                    url.replace("600x600bb", "100x100bb"))
-                if not data:
-                    continue
+                data = art_cache.get(url)
+                if data is None:
+                    data = self.pipeline.download_cover_bytes(
+                        url.replace("600x600bb", "100x100bb"))
+                    if not data:
+                        continue
+                    art_cache[url] = data
 
                 def show(lbl=label, raw=data):
                     if not win.winfo_exists():
@@ -1533,23 +1688,78 @@ class YTYoinkApp(tk.Tk):
 
                 self.after(0, show)
 
-        def worker():
-            try:
-                from itunes import search_itunes_candidates
-                cands = search_itunes_candidates(
-                    self._yt_meta.get("artist", ""),
-                    self._yt_meta.get("title", ""))
-                self.after(0, populate, cands)
-            except Exception as e:
-                self.after(0, lambda: info.config(
-                    text=f"Search failed: {e}", fg=FG_ERROR))
+        def run_search(term=None, f_artist="", f_album=""):
+            go.config(state="disabled")
+            info.config(text="Searching iTunes...", fg=FG_DIM)
+            for child in results.winfo_children():
+                child.destroy()
+            art_labels.clear()
 
-        threading.Thread(target=worker, daemon=True).start()
+            def worker():
+                try:
+                    from itunes import (search_itunes_candidates,
+                                        search_itunes_album_tracks,
+                                        lookup_apple_music)
+                    artist = self._yt_meta.get("artist", "")
+                    title = self._yt_meta.get("title", "")
+                    if term and "music.apple.com" in term:
+                        # Pasted Apple Music link: resolve it exactly
+                        cands = lookup_apple_music(term, artist, title)
+                    elif term:
+                        # User-driven search: rank by Apple's relevance for
+                        # THEIR words — don't drag results back toward the
+                        # original video's artist/title. An Album filter
+                        # additionally pulls that album's full track list.
+                        cands = []
+                        if f_album:
+                            cands = search_itunes_album_tracks(f_album,
+                                                               f_artist)
+                        extra = search_itunes_candidates("", "", limit=10,
+                                                         term=term)
+                        have = {(c.song.lower(), c.artist.lower(),
+                                 c.album.lower()) for c in cands}
+                        cands += [c for c in extra
+                                  if (c.song.lower(), c.artist.lower(),
+                                      c.album.lower()) not in have]
+                    else:
+                        cands = search_itunes_candidates(artist, title,
+                                                         limit=10)
+                    self.after(0, populate, cands)
+                except Exception as e:
+                    self.after(0, lambda: (
+                        go.config(state="normal"),
+                        info.config(text=f"Search failed: {e}", fg=FG_ERROR)))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def search_edited():
+            # The filter fields join the search itself, so "blueprint" +
+            # Artist "Jay-Z" actually searches for Jay-Z's Blueprint
+            query = query_field.entry.get().strip()
+            f_artist = filter_entries["artist"].get().strip()
+            f_album = filter_entries["album"].get().strip()
+            f_year = filter_entries["year"].get().strip()
+            if "music.apple.com" in query:
+                run_search(query)
+                return
+            combined = " ".join(p for p in (query, f_artist, f_album, f_year)
+                                if p)
+            if combined:
+                run_search(combined, f_artist, f_album)
+
+        go = self._make_button(search_row, "Search", search_edited,
+                               BG_BUTTON_ACCENT, FG_BUTTON_ACCENT,
+                               BG_BUTTON_ACCENT_HOVER)
+        go.pack(side="right")
+        query_field.entry.bind("<Return>", lambda e: search_edited())
+
+        run_search()
 
     def _apply_itunes_choice(self, match):
         """User picked a different iTunes match; refresh metadata and art."""
         self._status_bar.append(
             f"Using iTunes match: {match.artist} - {match.song}", "info")
+        snapshot_url = self._current_url
 
         def worker():
             cover = None
@@ -1558,6 +1768,8 @@ class YTYoinkApp(tk.Tk):
             self.after(0, apply, cover)
 
         def apply(cover):
+            if snapshot_url != self._current_url:
+                return  # a newer fetch replaced this song meanwhile
             yt = self._yt_meta or {}
             self._itunes_match = match
             self._itunes_meta = {
@@ -2041,7 +2253,12 @@ class YTYoinkApp(tk.Tk):
         self._next_in_queue()
 
     def _next_in_queue(self):
-        if not self._queue:
+        if not self._queue_running or not self._queue:
+            return
+        if self._ui_state in ("fetching", "downloading"):
+            # Busy (e.g. a manual fetch mid-review) — retry shortly instead
+            # of popping the item into a fetch that would be rejected
+            self.after(700, self._next_in_queue)
             return
         url = self._queue.pop(0)
         n = self._queue_total - len(self._queue)
@@ -2421,10 +2638,18 @@ class YTYoinkApp(tk.Tk):
     def _on_download(self):
         if not self._current_url:
             self._status_bar.append("No URL to download.", "warning")
+            if self._queue_running:
+                self._finish_queue("Queue stopped (no URL).", "warning")
             return
 
         if not self.config.download_folder or not os.path.isdir(self.config.download_folder):
             self._status_bar.append("Please set a valid download folder.", "warning")
+            if self._queue_running:
+                # Without this, an auto-mode queue would wedge forever with
+                # no visible way to cancel it
+                self._finish_queue(
+                    "Queue stopped: set a valid download folder first.",
+                    "warning")
             return
 
         self._set_ui_state("downloading")

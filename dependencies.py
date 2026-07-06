@@ -105,7 +105,7 @@ def _build_install_script(src, install_dir, target_exe, extract_dir,
         _ps_progress_form("YTYoink Setup")
         + "Step 'Installing YTYoink...' 15\n"
         "Start-Sleep -Seconds 2\n"
-        f"robocopy '{q(src)}' '{q(install_dir)}' /e /is /it /np /nfl /ndl | Out-Null\n"
+        f"robocopy '{q(src)}' '{q(install_dir)}' /e /is /it /r:2 /w:2 /np /nfl /ndl | Out-Null\n"
         "if ($LASTEXITCODE -ge 8) {\n"
         "  Step 'Installation failed. Please try again.' 100\n"
         "  Start-Sleep -Seconds 5\n"
@@ -132,32 +132,35 @@ def _launch_hidden_ps1(ps1_path: str) -> None:
 
 
 def _refresh_path() -> None:
-    """Re-read PATH from the Windows registry so newly installed tools are found."""
-    try:
-        machine_key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
-        )
-        machine_path, _ = winreg.QueryValueEx(machine_key, "Path")
-        winreg.CloseKey(machine_key)
-    except OSError:
-        machine_path = ""
+    """Merge registry PATH (with %VARS% expanded) into the process PATH so
+    newly installed tools are found without losing existing entries."""
+    def read_reg_path(root, subkey):
+        try:
+            key = winreg.OpenKey(root, subkey)
+            value, kind = winreg.QueryValueEx(key, "Path")
+            winreg.CloseKey(key)
+            if kind == winreg.REG_EXPAND_SZ:
+                value = winreg.ExpandEnvironmentStrings(value)
+            return value or ""
+        except OSError:
+            return ""
 
-    try:
-        user_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment")
-        user_path, _ = winreg.QueryValueEx(user_key, "Path")
-        winreg.CloseKey(user_key)
-    except OSError:
-        user_path = ""
+    machine_path = read_reg_path(
+        winreg.HKEY_LOCAL_MACHINE,
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")
+    user_path = read_reg_path(winreg.HKEY_CURRENT_USER, r"Environment")
+    winget_links = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                                "Microsoft", "WinGet", "Links")
 
-    new_path = f"{machine_path};{user_path}"
-
-    # Also include WinGet shim dir
-    winget_links = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Links")
-    if os.path.isdir(winget_links) and winget_links not in new_path:
-        new_path += f";{winget_links}"
-
-    os.environ["PATH"] = new_path
+    parts, seen = [], set()
+    for chunk in (os.environ.get("PATH", ""), machine_path, user_path,
+                  winget_links):
+        for p in chunk.split(";"):
+            p = p.strip()
+            if p and p.lower() not in seen:
+                seen.add(p.lower())
+                parts.append(p)
+    os.environ["PATH"] = ";".join(parts)
 
 
 def _find_command(name: str) -> bool:
@@ -547,6 +550,29 @@ def run_uninstall() -> None:
             set_status("Removing files...")
             shutil.rmtree(install_dir, ignore_errors=True)
 
+            # Our own exe and DLLs are locked while we run - a detached
+            # script sweeps the leftovers right after this process exits.
+            if os.path.isdir(install_dir):
+                try:
+                    q = _ps_quote
+                    ps1 = os.path.join(tempfile.gettempdir(),
+                                       "_ytyoink_cleanup.ps1")
+                    script = (
+                        "$ErrorActionPreference = 'SilentlyContinue'\n"
+                        f"Wait-Process -Id {os.getpid()} -Timeout 60\n"
+                        "for ($i = 0; $i -lt 15; $i++) {\n"
+                        f"  Remove-Item '{q(install_dir)}' -Recurse -Force\n"
+                        f"  if (-not (Test-Path '{q(install_dir)}')) {{ break }}\n"
+                        "  Start-Sleep -Seconds 2\n"
+                        "}\n"
+                        "Remove-Item $MyInvocation.MyCommand.Path -Force\n"
+                    )
+                    with open(ps1, "w", encoding="utf-8-sig") as f:
+                        f.write(script)
+                    _launch_hidden_ps1(ps1)
+                except Exception:
+                    pass
+
             set_status("Done. YTYoink has been removed.")
             root.after(2500, root.destroy)
 
@@ -627,7 +653,8 @@ def bootstrap_install() -> None:
                 import time
 
                 # Kill running app
-                subprocess.run(["taskkill", "/f", "/im", "YTYoink.exe"],
+                subprocess.run(["taskkill", "/f", "/im", "YTYoink.exe",
+                                "/fi", f"PID ne {os.getpid()}"],
                                capture_output=True, creationflags=CREATE_NO_WINDOW)
                 time.sleep(1)
 
@@ -826,24 +853,25 @@ def bootstrap_install() -> None:
             startmenu_lnk = os.path.join(startmenu_dir, "YTYoink.lnk")
 
             # ── Build PowerShell shortcut commands ────────────────────────────────
+            q = _ps_quote
             ps_shortcuts = []
             if want_desktop:
                 ps_shortcuts.append(
                     f"$ws=New-Object -ComObject WScript.Shell;"
-                    f"$lnk=$ws.CreateShortcut('{desktop_lnk}');"
-                    f"$lnk.TargetPath='{target_exe}';"
-                    f"$lnk.WorkingDirectory='{install_dir}';"
-                    f"$lnk.IconLocation='{target_exe},0';"
+                    f"$lnk=$ws.CreateShortcut('{q(desktop_lnk)}');"
+                    f"$lnk.TargetPath='{q(target_exe)}';"
+                    f"$lnk.WorkingDirectory='{q(install_dir)}';"
+                    f"$lnk.IconLocation='{q(target_exe)},0';"
                     f"$lnk.Save()"
                 )
             if want_startmenu:
                 ps_shortcuts.append(
-                    f"New-Item -ItemType Directory -Force -Path '{startmenu_dir}' | Out-Null;"
+                    f"New-Item -ItemType Directory -Force -Path '{q(startmenu_dir)}' | Out-Null;"
                     f"$ws=New-Object -ComObject WScript.Shell;"
-                    f"$lnk=$ws.CreateShortcut('{startmenu_lnk}');"
-                    f"$lnk.TargetPath='{target_exe}';"
-                    f"$lnk.WorkingDirectory='{install_dir}';"
-                    f"$lnk.IconLocation='{target_exe},0';"
+                    f"$lnk=$ws.CreateShortcut('{q(startmenu_lnk)}');"
+                    f"$lnk.TargetPath='{q(target_exe)}';"
+                    f"$lnk.WorkingDirectory='{q(install_dir)}';"
+                    f"$lnk.IconLocation='{q(target_exe)},0';"
                     f"$lnk.Save()"
                 )
 
