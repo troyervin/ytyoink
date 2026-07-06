@@ -954,7 +954,38 @@ def update_self(github_repo: str, current_version: str, status_callback=None) ->
     if _ver(latest) <= _ver(current_version):
         if status_callback:
             status_callback(f"YTYoink v{current_version} is up to date.")
+        try:
+            # Update applied fine — clear the loop-guard marker
+            guard_path = os.path.join(os.path.dirname(sys.executable),
+                                      "update_attempt.json")
+            if os.path.isfile(guard_path):
+                os.remove(guard_path)
+        except OSError:
+            pass
         return False
+
+    # Update-loop guard: if we already tried updating to this exact version
+    # moments ago and we are STILL on the old one, the swap failed — don't
+    # spin in an endless update-restart cycle.
+    try:
+        import time
+        guard_path = os.path.join(os.path.dirname(sys.executable),
+                                  "update_attempt.json")
+        if os.path.isfile(guard_path):
+            with open(guard_path, encoding="utf-8") as f:
+                last = json.load(f)
+            if last.get("target") == latest and \
+                    time.time() - float(last.get("ts", 0)) < 900:
+                if status_callback:
+                    status_callback(
+                        f"Update to {latest} did not apply last time. "
+                        "Skipping for now to avoid an update loop; it will "
+                        "retry in 15 minutes.")
+                return False
+        with open(guard_path, "w", encoding="utf-8") as f:
+            json.dump({"target": latest, "ts": time.time()}, f)
+    except Exception:
+        pass
 
     if status_callback:
         status_callback(f"YTYoink {latest} available, downloading update...")
