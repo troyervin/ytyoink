@@ -609,18 +609,20 @@ class YTYoinkApp(tk.Tk):
         self._url_field.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self._url_entry = self._url_field.entry
 
+        # Search sits to the RIGHT of Fetch Info: fetch belongs with the
+        # URL box beside it, search is its own entry point
+        self._search_btn = self._make_button(
+            url_row, "SearchYT", self._open_search,
+            BG_BUTTON, FG_TEXT, BG_BUTTON_HOVER, state="disabled",
+        )
+        self._search_btn.pack(side="right")
+
         self._fetch_btn = self._make_button(
             url_row, "Fetch Info", self._on_fetch_info,
             BG_BUTTON_ACCENT, FG_BUTTON_ACCENT, BG_BUTTON_ACCENT_HOVER,
             state="disabled",
         )
-        self._fetch_btn.pack(side="right")
-
-        self._search_btn = self._make_button(
-            url_row, "Search", self._open_search,
-            BG_BUTTON, FG_TEXT, BG_BUTTON_HOVER, state="disabled",
-        )
-        self._search_btn.pack(side="right", padx=(0, 6))
+        self._fetch_btn.pack(side="right", padx=(0, 6))
 
         self._url_entry.bind("<Return>", lambda e: self._on_fetch_info())
         # Note: Ctrl+V also fires <<Paste>>, so binding <Control-v> too
