@@ -14,6 +14,9 @@ DEFAULTS = {
     "ChooseCover": False,
     "OpenAfterDownload": False,
     "TurboMode": False,
+    "AskPlaylist": False,
+    "PlaylistReview": False,
+    "IgnoreMixes": True,
 }
 
 
@@ -26,6 +29,9 @@ class AppConfig:
     metadata_source: str = "itunes"  # "itunes" or "youtube"
     open_after_download: bool = False
     turbo_mode: bool = False
+    ask_playlist: bool = False
+    playlist_review: bool = False
+    ignore_mixes: bool = True
 
     _path: str = field(default="", repr=False)
 
@@ -45,7 +51,7 @@ class AppConfig:
 
         cfg.download_folder = data.get("DownloadFolder") or None
         cfg.format = (data.get("Format") or "m4a").lower()
-        if cfg.format not in ("m4a", "mp3"):
+        if cfg.format not in ("m4a", "mp3", "opus"):
             cfg.format = "m4a"
 
         cfg.show_progress = bool(data.get("ShowProgress", False))
@@ -62,6 +68,9 @@ class AppConfig:
 
         cfg.open_after_download = bool(data.get("OpenAfterDownload", False))
         cfg.turbo_mode = bool(data.get("TurboMode", False))
+        cfg.ask_playlist = bool(data.get("AskPlaylist", False))
+        cfg.playlist_review = bool(data.get("PlaylistReview", False))
+        cfg.ignore_mixes = bool(data.get("IgnoreMixes", True))
 
         return cfg
 
@@ -90,6 +99,9 @@ class AppConfig:
             "MetadataSource": self.metadata_source,
             "OpenAfterDownload": self.open_after_download,
             "TurboMode": self.turbo_mode,
+            "AskPlaylist": self.ask_playlist,
+            "PlaylistReview": self.playlist_review,
+            "IgnoreMixes": self.ignore_mixes,
             "ChooseCover": False,  # kept for backward compat with PS script
         }
         try:

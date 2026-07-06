@@ -66,6 +66,13 @@ class YTYoinkApp(tk.Tk):
         self._scrollbar_visible = False
         self._logo_photo = None  # prevent GC
         self._deps_ready = False  # set True after dependency check passes
+        self._queue: list[str] = []
+        self._queue_total = 0
+        self._queue_running = False
+        self._queue_review = False    # review-each mode: wait for the user
+        self._queue_source = None     # per-batch metadata/artwork override
+        self._queue_album_hint = None  # (artist, album) picked via Wrong match?
+        self._ui_state = "idle"
 
         self._build_window()
         configure_ttk_theme()
@@ -76,16 +83,16 @@ class YTYoinkApp(tk.Tk):
         self.after(10, self._strip_native_titlebar)
         self.after(50, self._enforce_min_height)
 
-    def _strip_native_titlebar(self):
-        """Remove the Windows caption bar. Keeps the resize borders, the
-        taskbar entry, and Win+arrow snapping — unlike overrideredirect.
-        The app header provides its own title, icon, and window buttons."""
+    def _strip_native_titlebar(self, window=None):
+        """Remove the Windows caption bar (of the main window or a popup).
+        Keeps the resize borders, the taskbar entry, and Win+arrow snapping,
+        unlike overrideredirect. Our own header provides title and buttons."""
         try:
             import ctypes
             GWL_STYLE = -16
             WS_CAPTION = 0x00C00000
             user32 = ctypes.windll.user32
-            hwnd = user32.GetParent(self.winfo_id())
+            hwnd = user32.GetParent((window or self).winfo_id())
             get_style = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
             set_style = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
             style = get_style(hwnd, GWL_STYLE)
@@ -553,6 +560,8 @@ class YTYoinkApp(tk.Tk):
         self._keep_overrides_var = tk.BooleanVar(value=False)
         self._open_after_var = tk.BooleanVar(value=self.config.open_after_download)
         self._turbo_var = tk.BooleanVar(value=self.config.turbo_mode)
+        self._ask_playlist_var = tk.BooleanVar(value=self.config.ask_playlist)
+        self._ignore_mixes_var = tk.BooleanVar(value=self.config.ignore_mixes)
         self._settings_win = None
 
         def title_check(row, text, var, cmd=None):
@@ -575,7 +584,9 @@ class YTYoinkApp(tk.Tk):
             self._turbo_cb,
             "Turbo: fetching a URL downloads it immediately,\n"
             "skipping the preview step. Uses your preferred\n"
-            "metadata and artwork sources from Settings (⚙).",
+            "metadata and artwork sources from Settings (⚙).\n"
+            "Careful: with a playlist link, Turbo downloads\n"
+            "the whole playlist.",
         )
 
         url_row = tk.Frame(url_inner, bg=BG_SECTION)
@@ -592,9 +603,16 @@ class YTYoinkApp(tk.Tk):
         )
         self._fetch_btn.pack(side="right")
 
+        self._search_btn = self._make_button(
+            url_row, "Search", self._open_search,
+            BG_BUTTON, FG_TEXT, BG_BUTTON_HOVER, state="disabled",
+        )
+        self._search_btn.pack(side="right", padx=(0, 6))
+
         self._url_entry.bind("<Return>", lambda e: self._on_fetch_info())
+        # Note: Ctrl+V also fires <<Paste>>, so binding <Control-v> too
+        # would run the auto-fetch twice for one paste.
         self._url_entry.bind("<<Paste>>", lambda e: self.after(100, self._on_url_paste))
-        self._url_entry.bind("<Control-v>", lambda e: self.after(100, self._on_url_paste))
         self._url_entry.bind("<FocusIn>", self._on_url_focus)
 
         # ---- Video Info (compact strip, hidden until first fetch) ----
@@ -614,11 +632,21 @@ class YTYoinkApp(tk.Tk):
         info_text = tk.Frame(info_card, bg=BG_SECTION)
         info_text.pack(side="left", fill="both", expand=True)
 
+        title_row = tk.Frame(info_text, bg=BG_SECTION)
+        title_row.pack(anchor="w", fill="x", pady=(2, 2))
+
         self._info_title = tk.Label(
-            info_text, text="", font=FONT_LABEL_BOLD,
-            bg=BG_SECTION, fg=FG_TEXT, wraplength=480, justify="left", anchor="nw",
+            title_row, text="", font=FONT_LABEL_BOLD,
+            bg=BG_SECTION, fg=FG_TEXT, wraplength=460, justify="left", anchor="nw",
         )
-        self._info_title.pack(anchor="w", pady=(2, 2))
+        self._info_title.pack(side="left")
+
+        # Already-downloaded badge (hidden until a fetch matches history)
+        self._dup_photo = self._make_alert_photo(16)
+        self._dup_badge = tk.Label(title_row, image=self._dup_photo,
+                                   bg=BG_SECTION)
+        self._dup_tip_text = ""
+        self._make_tooltip(self._dup_badge, lambda: self._dup_tip_text)
 
         info_sub_row = tk.Frame(info_text, bg=BG_SECTION)
         info_sub_row.pack(anchor="w")
@@ -672,6 +700,13 @@ class YTYoinkApp(tk.Tk):
             selectcolor=BG_INPUT, activebackground=BG_SECTION, activeforeground=FG_TEXT,
             highlightthickness=0, bd=0, command=self._on_meta_source_change,
         ).pack(side="left")
+
+        wrong_match = tk.Label(
+            self._meta_source_frame, text="Wrong match?", font=FONT_SMALL,
+            bg=BG_SECTION, fg=FG_ACCENT, cursor="hand2",
+        )
+        wrong_match.pack(side="right")
+        wrong_match.bind("<Button-1>", lambda e: self._open_match_picker())
 
         self._meta_title = CheckboxEntry(meta_inner, "Title")
         self._meta_title.pack(fill="x", pady=2)
@@ -783,6 +818,22 @@ class YTYoinkApp(tk.Tk):
         )
         self._cancel_btn.pack(side="left")
 
+        self._history_btn = self._make_button(
+            btn_frame, "History", self._open_history,
+            BG_BUTTON, FG_TEXT, BG_BUTTON_HOVER, pady=5,
+        )
+        self._history_btn.pack(side="left", padx=(8, 0))
+
+        # Skip / Cancel batch — only shown while reviewing a queue
+        self._skip_btn = self._make_button(
+            btn_frame, "Skip", self._skip_current,
+            BG_BUTTON, FG_WARN, BG_BUTTON_HOVER, pady=5,
+        )
+        self._cancel_batch_btn = self._make_button(
+            btn_frame, "Cancel batch", self._cancel_batch,
+            BG_BUTTON_CANCEL, "#181825", BG_BUTTON_CANCEL_HOVER, pady=5,
+        )
+
         # Open-after toggle — right side, aligned with the action buttons
         tk.Checkbutton(
             btn_frame, text="Open file after download", variable=self._open_after_var,
@@ -871,16 +922,23 @@ class YTYoinkApp(tk.Tk):
         self.after(50, self._check_clipboard_for_url)
 
     def _check_clipboard_for_url(self):
+        """Convenience: clicking an EMPTY url box auto-fills it from the
+        clipboard. Never clobbers existing content or re-grabs the same
+        link — refocusing after popups used to restart the fetch and wipe
+        user edits (e.g. a hand-picked iTunes match)."""
+        if self._queue_running:
+            return
         try:
             clip = self.clipboard_get().strip()
         except Exception:
             return
         if not clip or not self._is_youtube_url(clip):
             return
-        current = self._url_entry.get().strip()
-        if clip == current:
+        if self._url_entry.get().strip():
             return
-        self._url_entry.delete(0, tk.END)
+        if clip == getattr(self, "_last_clip_grab", ""):
+            return
+        self._last_clip_grab = clip
         self._url_entry.insert(0, clip)
         self.after(100, self._on_url_paste)
 
@@ -910,6 +968,44 @@ class YTYoinkApp(tk.Tk):
         if not self._deps_ready:
             self._status_bar.append("Please wait, checking dependencies...", "warning")
             return
+        # Re-entry guard: a paste can fire multiple triggers at once
+        if self._ui_state in ("fetching", "downloading"):
+            return
+
+        # Playlist links: ask (popup), turbo the whole list, or take just
+        # the pasted video — depending on settings. Notices are appended
+        # after the log clear below so they stay visible.
+        playlist_notice = None
+        if self._is_playlist_url(url) and not self._queue_running:
+            single = normalize_youtube_url(url)
+            has_single = "watch?v=" in single and "list=" not in single
+            if self.config.ignore_mixes and self._is_mix_url(url):
+                if has_single:
+                    playlist_notice = ("YouTube Mix ignored; downloading "
+                                       "the video you pasted.")
+                    url = single
+                else:
+                    self._status_bar.append(
+                        "This is an auto-generated Mix link with no single "
+                        "video in it. Nothing to download.", "warning")
+                    return
+            elif not self.config.ask_playlist:
+                if has_single:
+                    playlist_notice = ("Playlist ignored (asking is off in "
+                                       "settings); downloading the video "
+                                       "you pasted.")
+                    url = single
+                else:
+                    self._status_bar.append(
+                        "This playlist link has no single video. Enable "
+                        "playlist asking in settings to pick from it.", "warning")
+                    return
+            elif self._turbo_var.get():
+                self._turbo_playlist(url)
+                return
+            else:
+                self._open_playlist_picker(url)
+                return
 
         normalized = normalize_youtube_url(url)
         if normalized != url:
@@ -919,7 +1015,10 @@ class YTYoinkApp(tk.Tk):
         self._current_url = normalized
 
         self._set_ui_state("fetching")
-        self._status_bar.clear()
+        if not self._queue_running:
+            self._status_bar.clear()
+        if playlist_notice:
+            self._status_bar.append(playlist_notice, "dim")
         self._status_bar.append("Fetching video info...", "info")
         self._progress_var.set(0)
 
@@ -1000,6 +1099,21 @@ class YTYoinkApp(tk.Tk):
                 itunes_match = it1
                 if it2 and (not it1 or it2.score > (it1.score + 2)):
                     itunes_match = it2
+
+                # Batch album memory: if the user picked an album via
+                # "Wrong match?", prefer candidates from that album. Songs
+                # that aren't on it fall back to the normal best match.
+                hint = self._queue_album_hint if self._queue_running else None
+                if hint:
+                    from itunes import search_itunes_candidates
+                    cands = search_itunes_candidates(yt_artist, yt_title)
+                    same_album = [c for c in cands
+                                  if c.album.lower() == hint[1]]
+                    if same_album:
+                        same_album.sort(
+                            key=lambda c: (hint[0] not in c.artist.lower(),
+                                           -c.score))
+                        itunes_match = same_album[0]
             except Exception:
                 pass
 
@@ -1049,6 +1163,7 @@ class YTYoinkApp(tk.Tk):
         self._itunes_cover_bytes = itunes_cover
 
         self._info_title.config(text=info.title)
+        self._update_dup_badge(self._current_url)
         self._info_uploader.config(text=info.uploader)
         mins, secs = divmod(info.duration, 60)
         self._info_duration.config(text=f"·  {mins}:{secs:02d}")
@@ -1086,19 +1201,896 @@ class YTYoinkApp(tk.Tk):
         self.after(0, self._sync_canvas)
         self.after(0, self._grow_to_fit)
 
-        if self._turbo_var.get():
+        if self._queue_running:
+            # Per-batch source override from the playlist popup
+            if self._queue_source in ("itunes", "youtube"):
+                if self._queue_source == "itunes" and self._itunes_meta:
+                    self._meta_source_var.set("itunes")
+                elif self._queue_source == "youtube":
+                    self._meta_source_var.set("youtube")
+                self._apply_meta_source()
+                if self._queue_source == "itunes" and self._itunes_cover_bytes:
+                    self._select_cover("itunes")
+                elif self._queue_source == "youtube" and self._yt_thumb_bytes:
+                    self._select_cover("youtube")
+            if self._queue_album_hint and itunes_meta and \
+                    itunes_meta.get("album", "").lower() == self._queue_album_hint[1]:
+                self._status_bar.append(
+                    f"Matched to your chosen album: {itunes_meta['album']}",
+                    "dim")
+            if self._queue_review:
+                self._show_skip(True)
+                self._status_bar.append(
+                    "Review: adjust anything, then hit Download (or Skip).",
+                    "info")
+            else:
+                self.after(50, self._on_download)
+        elif self._turbo_var.get():
             self.after(50, self._on_download)
 
     def _on_fetch_error(self, error_msg):
         self._status_bar.append(f"Error: {error_msg}", "error")
         self._set_ui_state("idle")
+        if self._queue_running:
+            if self._queue:
+                self._status_bar.append("Skipping to the next video in the queue...", "warning")
+                self.after(600, self._next_in_queue)
+            else:
+                self._finish_queue("Queue finished (last video failed).", "warning")
 
     def _on_turbo_change(self):
         self.config.turbo_mode = self._turbo_var.get()
         self.config.save()
 
-    def _make_tooltip(self, widget, text: str):
-        """Show a themed tooltip under the widget after a short hover delay."""
+    def _on_ask_playlist_change(self):
+        self.config.ask_playlist = self._ask_playlist_var.get()
+        self.config.save()
+
+    def _on_ignore_mixes_change(self):
+        self.config.ignore_mixes = self._ignore_mixes_var.get()
+        self.config.save()
+
+    def report_callback_exception(self, exc, val, tb):
+        """Log unexpected UI errors to crash.log instead of losing them."""
+        import traceback
+        from datetime import datetime
+        try:
+            with open(os.path.join(app_dir(), "crash.log"), "a", encoding="utf-8") as f:
+                f.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] UI error:\n")
+                traceback.print_exception(exc, val, tb, file=f)
+        except OSError:
+            pass
+        try:
+            self._status_bar.append(
+                f"Unexpected error: {val} (details saved to crash.log)", "error")
+        except Exception:
+            pass
+
+    # ---- Shared popup scaffolding ----
+
+    def _make_popup(self, title: str, body_bg=BG_MAIN):
+        """Themed transient window with our own title bar (native caption
+        stripped): app-styled title, drag-to-move, custom close button."""
+        win = tk.Toplevel(self)
+        win.title(title)  # still shown in alt-tab
+        win.configure(bg=body_bg)
+        win.resizable(False, False)
+        win.transient(self)
+        win.geometry(f"+{self.winfo_rootx() + 60}+{self.winfo_rooty() + 90}")
+
+        header = tk.Frame(win, bg=body_bg)
+        header.pack(fill="x")
+        title_lbl = tk.Label(header, text=title, font=FONT_LABEL_BOLD,
+                             bg=body_bg, fg=FG_LABEL)
+        title_lbl.pack(side="left", padx=14, pady=(8, 2))
+
+        close = tk.Label(header, text=chr(0xE8BB),
+                         font=("Segoe MDL2 Assets", 9),
+                         bg=body_bg, fg=FG_LABEL, width=4, pady=5,
+                         cursor="hand2")
+        close.pack(side="right", padx=(0, 4))
+        close.bind("<Enter>",
+                   lambda e: close.config(bg=BG_BUTTON_CANCEL, fg="#181825"))
+        close.bind("<Leave>", lambda e: close.config(bg=body_bg, fg=FG_LABEL))
+        close.bind("<Button-1>", lambda e: win.destroy())
+
+        # Drag-to-move via the native move loop (same pattern as the main
+        # title bar: threshold first, then hand off via PostMessage)
+        press = {"pos": None}
+
+        def on_press(event):
+            press["pos"] = (event.x_root, event.y_root)
+
+        def on_motion(event):
+            if press["pos"] is None:
+                return
+            if (abs(event.x_root - press["pos"][0])
+                    + abs(event.y_root - press["pos"][1])) < 4:
+                return
+            press["pos"] = None
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+                ctypes.windll.user32.ReleaseCapture()
+                ctypes.windll.user32.PostMessageW(hwnd, 0xA1, 2, 0)
+            except Exception:
+                pass
+
+        for w in (header, title_lbl):
+            w.bind("<Button-1>", on_press)
+            w.bind("<B1-Motion>", on_motion)
+            w.bind("<ButtonRelease-1>", lambda e: press.update(pos=None))
+
+        # Tk re-applies its own styles when the window maps, so strip the
+        # caption right after mapping (plus a late fallback pass).
+        win.bind("<Map>",
+                 lambda e: win.after(10, lambda: self._strip_native_titlebar(win)),
+                 add="+")
+        win.after(150, lambda: self._strip_native_titlebar(win))
+
+        body = tk.Frame(win, bg=body_bg, padx=14, pady=12)
+        body.pack(fill="both", expand=True)
+        return win, body
+
+    def _scroll_area(self, parent, height=320, width=540):
+        """Scrollable themed list area; returns (wrapper, inner frame)."""
+        wrap = tk.Frame(parent, bg=BG_MAIN)
+        canvas = tk.Canvas(wrap, bg=BG_MAIN, highlightthickness=0,
+                           height=height, width=width)
+        bar = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview,
+                            style="Custom.Vertical.TScrollbar")
+        inner = tk.Frame(canvas, bg=BG_MAIN)
+        item = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(item, width=e.width))
+        canvas.configure(yscrollcommand=bar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+
+        def wheel(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        win = wrap.winfo_toplevel()
+        self.bind_all("<MouseWheel>", wheel)
+        win.bind("<Destroy>", lambda e: self.bind_all(
+            "<MouseWheel>", self._on_mousewheel) if e.widget is win else None)
+        return wrap, inner
+
+    def _reveal_file(self, path: str):
+        """Show a file in Explorer; falls back to opening its folder."""
+        if not path:
+            return
+        path = os.path.normpath(path)
+        if os.path.isfile(path):
+            subprocess.run(["explorer", "/select," + path])
+        elif os.path.isdir(os.path.dirname(path)):
+            os.startfile(os.path.dirname(path))
+
+    # ---- YouTube search popup ----
+
+    def _open_search(self):
+        if getattr(self, "_search_win", None) and self._search_win.winfo_exists():
+            self._search_win.lift()
+            return
+        win, body = self._make_popup("Search YouTube")
+        self._search_win = win
+
+        row = tk.Frame(body, bg=BG_MAIN)
+        row.pack(fill="x")
+        field = RoundField(row, height=32, width=44)
+        field.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        field.config(width=400)
+
+        info = tk.Label(body, text="Type a song or artist and hit Enter.",
+                        font=FONT_SMALL, bg=BG_MAIN, fg=FG_DIM, anchor="w")
+        results = tk.Frame(body, bg=BG_MAIN)
+
+        def set_row_bg(frame, color):
+            frame.config(bg=color)
+            for child in frame.winfo_children():
+                child.config(bg=color)
+
+        def pick(url):
+            win.destroy()
+            self._url_entry.config(state="normal")
+            self._url_entry.delete(0, tk.END)
+            self._url_entry.insert(0, url)
+            self._on_fetch_info()
+
+        def populate(rows):
+            if not win.winfo_exists():
+                return
+            go.config(state="normal")
+            info.config(fg=FG_DIM, text="No results." if not rows
+                        else "Click a result to fetch it:")
+            for r in rows:
+                rowf = tk.Frame(results, bg=BG_SECTION, padx=10, pady=6,
+                                highlightbackground=BORDER_COLOR,
+                                highlightthickness=1, cursor="hand2")
+                rowf.pack(fill="x", pady=2)
+                tk.Label(rowf, text=r["title"][:72], font=FONT_LABEL,
+                         bg=BG_SECTION, fg=FG_TEXT, anchor="w").pack(fill="x")
+                sub = "  ·  ".join(x for x in (r["uploader"], r["duration"]) if x)
+                tk.Label(rowf, text=sub, font=FONT_SMALL,
+                         bg=BG_SECTION, fg=FG_DIM, anchor="w").pack(fill="x")
+                for w in (rowf, *rowf.winfo_children()):
+                    w.bind("<Button-1>", lambda e, u=r["url"]: pick(u))
+                    w.bind("<Enter>", lambda e, f=rowf: set_row_bg(f, BG_INPUT))
+                    w.bind("<Leave>", lambda e, f=rowf: set_row_bg(f, BG_SECTION))
+
+        def fail(msg):
+            if not win.winfo_exists():
+                return
+            go.config(state="normal")
+            info.config(text=f"Search failed: {msg}", fg=FG_ERROR)
+
+        def start():
+            query = field.entry.get().strip()
+            if not query:
+                return
+            go.config(state="disabled")
+            info.config(text="Searching...", fg=FG_DIM)
+            for child in results.winfo_children():
+                child.destroy()
+
+            def worker():
+                try:
+                    from downloader import search_youtube
+                    rows = search_youtube(query)
+                    self.after(0, populate, rows)
+                except Exception as e:
+                    self.after(0, fail, str(e))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        go = self._make_button(row, "Search", start, BG_BUTTON_ACCENT,
+                               FG_BUTTON_ACCENT, BG_BUTTON_ACCENT_HOVER)
+        go.pack(side="right")
+        info.pack(fill="x", pady=(8, 2))
+        results.pack(fill="both", expand=True)
+        field.entry.bind("<Return>", lambda e: start())
+        field.entry.focus_set()
+
+    # ---- iTunes match picker ----
+
+    def _open_match_picker(self):
+        if not self._yt_meta:
+            return
+        if getattr(self, "_match_win", None) and self._match_win.winfo_exists():
+            self._match_win.lift()
+            return
+        win, body = self._make_popup("Choose iTunes match")
+        self._match_win = win
+
+        info = tk.Label(body, text="Searching iTunes...", font=FONT_SMALL,
+                        bg=BG_MAIN, fg=FG_DIM, anchor="w")
+        info.pack(fill="x", pady=(0, 4))
+        results = tk.Frame(body, bg=BG_MAIN)
+        results.pack(fill="both", expand=True)
+
+        def set_row_bg(frame, color):
+            frame.config(bg=color)
+            for child in frame.winfo_children():
+                child.config(bg=color)
+
+        art_labels = []
+
+        def populate(cands):
+            if not win.winfo_exists():
+                return
+            if not cands:
+                info.config(text="No iTunes matches found.", fg=FG_WARN)
+                return
+            info.config(text="Click the correct song:")
+            for m in cands:
+                rowf = tk.Frame(results, bg=BG_SECTION, padx=8, pady=6,
+                                highlightbackground=BORDER_COLOR,
+                                highlightthickness=1, cursor="hand2")
+                rowf.pack(fill="x", pady=2)
+                art = tk.Label(rowf, bg=BG_INPUT, width=6, height=3)
+                art.pack(side="left", padx=(0, 10))
+                art_labels.append((art, m.artwork_url))
+                text = tk.Frame(rowf, bg=BG_SECTION)
+                text.pack(side="left", fill="x", expand=True)
+                tk.Label(text, text=f"{m.artist} - {m.song}"[:70],
+                         font=FONT_LABEL, bg=BG_SECTION, fg=FG_TEXT,
+                         anchor="w").pack(fill="x")
+                sub = "  ·  ".join(x for x in (m.album, m.year, m.genre) if x)
+                tk.Label(text, text=sub[:80], font=FONT_SMALL, bg=BG_SECTION,
+                         fg=FG_DIM, anchor="w").pack(fill="x")
+                widgets = [rowf, art, text, *text.winfo_children()]
+                for w in widgets:
+                    w.bind("<Button-1>",
+                           lambda e, mm=m: (win.destroy(),
+                                            self._apply_itunes_choice(mm)))
+                    w.bind("<Enter>", lambda e, f=rowf: set_row_bg(f, BG_INPUT))
+                    w.bind("<Leave>", lambda e, f=rowf: set_row_bg(f, BG_SECTION))
+            threading.Thread(target=load_art, daemon=True).start()
+
+        def load_art():
+            import io
+            for label, url in art_labels:
+                if not url:
+                    continue
+                data = self.pipeline.download_cover_bytes(
+                    url.replace("600x600bb", "100x100bb"))
+                if not data:
+                    continue
+
+                def show(lbl=label, raw=data):
+                    if not win.winfo_exists():
+                        return
+                    try:
+                        img = Image.open(io.BytesIO(raw)).resize((44, 44),
+                                                                 Image.LANCZOS)
+                        photo = ImageTk.PhotoImage(img)
+                        lbl._photo = photo  # prevent GC
+                        lbl.config(image=photo, width=44, height=44)
+                    except Exception:
+                        pass
+
+                self.after(0, show)
+
+        def worker():
+            try:
+                from itunes import search_itunes_candidates
+                cands = search_itunes_candidates(
+                    self._yt_meta.get("artist", ""),
+                    self._yt_meta.get("title", ""))
+                self.after(0, populate, cands)
+            except Exception as e:
+                self.after(0, lambda: info.config(
+                    text=f"Search failed: {e}", fg=FG_ERROR))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_itunes_choice(self, match):
+        """User picked a different iTunes match; refresh metadata and art."""
+        self._status_bar.append(
+            f"Using iTunes match: {match.artist} - {match.song}", "info")
+
+        def worker():
+            cover = None
+            if match.artwork_url:
+                cover = self.pipeline.download_cover_bytes(match.artwork_url)
+            self.after(0, apply, cover)
+
+        def apply(cover):
+            yt = self._yt_meta or {}
+            self._itunes_match = match
+            self._itunes_meta = {
+                "title": match.song or yt.get("title", ""),
+                "artist": match.artist or yt.get("artist", ""),
+                "album": match.album or yt.get("album", ""),
+                "year": match.year or yt.get("year", ""),
+                "genre": match.genre or yt.get("genre", ""),
+            }
+            if cover:
+                self._itunes_cover_bytes = cover
+            self._meta_source_var.set("itunes")
+            self._apply_meta_source()
+            self._update_cover_previews()
+            # In a batch, remember the picked album — later songs prefer
+            # iTunes matches from it when they have one
+            if self._queue_running and match.album:
+                self._queue_album_hint = (match.artist.lower(),
+                                          match.album.lower())
+                self._status_bar.append(
+                    f"Album remembered for this batch: {match.album}", "dim")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _make_alert_photo(self, size: int = 16):
+        """Draw a small amber exclamation badge (anti-aliased via PIL)."""
+        if not HAS_PIL:
+            return None
+        try:
+            from PIL import ImageDraw
+            ss = 4
+            big = size * ss
+            img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            draw.ellipse((0, 0, big - 1, big - 1), fill="#fab387")
+            cx, w = big // 2, max(big // 11, 2)
+            draw.rounded_rectangle(
+                (cx - w, int(big * 0.20), cx + w, int(big * 0.58)),
+                radius=w, fill="#181825")
+            draw.ellipse((cx - w, int(big * 0.68), cx + w, int(big * 0.68) + 2 * w),
+                         fill="#181825")
+            return ImageTk.PhotoImage(img.resize((size, size), Image.LANCZOS))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _video_id(url: str) -> str:
+        """Extract the video id from any YouTube URL shape, so the same
+        video matches whether it came in bare, in a playlist, as a
+        youtu.be link, or as a short."""
+        try:
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(url or "")
+            v = parse_qs(parsed.query).get("v", [None])[0]
+            if v:
+                return v
+            host = (parsed.hostname or "").lower()
+            if "youtu.be" in host:
+                return parsed.path.strip("/").split("/")[0]
+            if parsed.path.startswith("/shorts/"):
+                return parsed.path.split("/")[2]
+        except Exception:
+            pass
+        return url or ""
+
+    def _update_dup_badge(self, url: str):
+        """Show the already-downloaded badge when this video is in history."""
+        uid = self._video_id(url)
+        hits = [e for e in self._load_history()
+                if uid and self._video_id(e.get("url", "")) == uid]
+        if hits:
+            last = hits[0]
+            text = f"You've downloaded this one before.\nLast on {last.get('ts', '?')}"
+            if last.get("file"):
+                text += f"\nSaved as {last['file']}"
+            if len(hits) > 1:
+                text += f"\nDownloaded {len(hits)} times total."
+            self._dup_tip_text = text
+            if self._dup_photo:
+                self._dup_badge.pack(side="left", padx=(8, 0))
+        else:
+            self._dup_tip_text = ""
+            self._dup_badge.pack_forget()
+
+    # ---- Download history ----
+
+    HISTORY_MAX = 100
+
+    def _history_path(self):
+        return os.path.join(app_dir(), "history.json")
+
+    def _load_history(self) -> list:
+        import json
+        try:
+            with open(self._history_path(), encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _append_history(self, filename: str, path: str, url: str = ""):
+        import json
+        from datetime import datetime
+        entries = self._load_history()
+        entries.insert(0, {"file": filename, "path": path, "url": url,
+                           "ts": datetime.now().strftime("%Y-%m-%d %H:%M")})
+        try:
+            with open(self._history_path(), "w", encoding="utf-8") as f:
+                json.dump(entries[:self.HISTORY_MAX], f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def _open_history(self):
+        if getattr(self, "_history_win", None) and self._history_win.winfo_exists():
+            self._history_win.lift()
+            return
+        win, body = self._make_popup("Download History")
+        self._history_win = win
+
+        entries = self._load_history()
+        if not entries:
+            tk.Label(body, text="Nothing downloaded yet.", font=FONT_LABEL,
+                     bg=BG_MAIN, fg=FG_DIM).pack(pady=20, padx=40)
+            return
+
+        tk.Label(body, text="Click a download to show it in Explorer:",
+                 font=FONT_SMALL, bg=BG_MAIN, fg=FG_DIM,
+                 anchor="w").pack(fill="x", pady=(0, 4))
+        wrap, inner = self._scroll_area(
+            body, height=min(360, 34 * len(entries) + 10))
+        wrap.pack(fill="both", expand=True)
+
+        def set_row_bg(frame, color):
+            frame.config(bg=color)
+            for child in frame.winfo_children():
+                child.config(bg=color)
+
+        for e in entries:
+            rowf = tk.Frame(inner, bg=BG_SECTION, padx=10, pady=5,
+                            cursor="hand2")
+            rowf.pack(fill="x", pady=1)
+            tk.Label(rowf, text=e.get("ts", ""), font=FONT_SMALL,
+                     bg=BG_SECTION, fg=FG_DIM).pack(side="right")
+            tk.Label(rowf, text=e.get("file", "?")[:64], font=FONT_SMALL,
+                     bg=BG_SECTION, fg=FG_TEXT, anchor="w").pack(
+                side="left", fill="x", expand=True)
+            for w in (rowf, *rowf.winfo_children()):
+                w.bind("<Button-1>",
+                       lambda ev, p=e.get("path", ""): self._reveal_file(p))
+                w.bind("<Enter>", lambda ev, f=rowf: set_row_bg(f, BG_INPUT))
+                w.bind("<Leave>", lambda ev, f=rowf: set_row_bg(f, BG_SECTION))
+
+    # ---- Playlist picker + queue ----
+
+    @staticmethod
+    def _is_playlist_url(url: str) -> bool:
+        try:
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(url)
+            if "list" in parse_qs(parsed.query):
+                return True
+            return parsed.path.startswith("/playlist")
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_mix_url(url: str) -> bool:
+        """Auto-generated YouTube Mix/radio lists have RD-prefixed ids.
+        Real playlists (PL...) and albums (OLAK...) don't match."""
+        try:
+            from urllib.parse import urlparse, parse_qs
+            list_id = parse_qs(urlparse(url).query).get("list", [""])[0]
+            return list_id.startswith("RD")
+        except Exception:
+            return False
+
+    def _fetch_single(self, url: str):
+        self._url_entry.config(state="normal")
+        self._url_entry.delete(0, tk.END)
+        self._url_entry.insert(0, url)
+        self._on_fetch_info()
+
+    def _turbo_playlist(self, url: str):
+        """Turbo + playlist link + asking enabled: queue the whole playlist."""
+        self._set_ui_state("fetching")
+        self._status_bar.append("Turbo: reading playlist...", "info")
+
+        def fail(msg):
+            self._set_ui_state("idle")
+            single = normalize_youtube_url(url)
+            if "watch?v=" in single:
+                self._status_bar.append(
+                    f"Could not read playlist ({msg}). Downloading the video only.",
+                    "warning")
+                self._fetch_single(single)
+            else:
+                self._status_bar.append(f"Could not read playlist ({msg}).", "error")
+
+        def go(title, rows):
+            self._set_ui_state("idle")
+            if not rows:
+                fail("no entries")
+                return
+            self._status_bar.append(
+                f"Turbo is ON: downloading the ENTIRE playlist ({len(rows)} videos). "
+                "Cancel to stop, or turn Turbo off if you only wanted one.",
+                "warning")
+            self._start_queue([r["url"] for r in rows])
+
+        def worker():
+            try:
+                from downloader import list_playlist
+                title, rows = list_playlist(url)
+                self.after(0, go, title, rows)
+            except Exception as e:
+                self.after(0, fail, str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_playlist_picker(self, url: str):
+        self._set_ui_state("fetching")
+        self._status_bar.append("Reading playlist...", "info")
+
+        def fallback(msg):
+            self._set_ui_state("idle")
+            single = normalize_youtube_url(url)
+            if "watch?v=" in single:
+                self._status_bar.append(
+                    f"Could not read playlist ({msg}). Fetching the video only.",
+                    "warning")
+                self._fetch_single(single)
+            else:
+                self._status_bar.append(
+                    f"Could not read playlist ({msg}).", "error")
+
+        def done(title, rows):
+            self._set_ui_state("idle")
+            if not rows:
+                fallback("no entries")
+                return
+            if len(rows) == 1:
+                self._fetch_single(rows[0]["url"])
+                return
+            self._show_playlist_popup(url, title, rows)
+
+        def worker():
+            try:
+                from downloader import list_playlist
+                title, rows = list_playlist(url)
+                self.after(0, done, title, rows)
+            except Exception as e:
+                self.after(0, fallback, str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_playlist_popup(self, source_url, playlist_title, rows):
+        if getattr(self, "_playlist_win", None) and self._playlist_win.winfo_exists():
+            self._playlist_win.lift()
+            return
+        win, body = self._make_popup("Playlist detected")
+        self._playlist_win = win
+
+        # The video actually pasted (watch?v=...&list=...), if any
+        primary_url = None
+        try:
+            from urllib.parse import urlparse, parse_qs
+            v = parse_qs(urlparse(source_url).query).get("v", [None])[0]
+            if v:
+                primary_url = f"https://www.youtube.com/watch?v={v}"
+        except Exception:
+            pass
+
+        tk.Label(body, text=playlist_title[:70], font=FONT_LABEL_BOLD,
+                 bg=BG_MAIN, fg=FG_TEXT, anchor="w").pack(fill="x")
+        tk.Label(body, text=f"{len(rows)} videos. Pick what to download:",
+                 font=FONT_SMALL, bg=BG_MAIN, fg=FG_DIM,
+                 anchor="w").pack(fill="x", pady=(2, 0))
+
+        # YouTube "Mix" radios are generated fresh per viewer and session,
+        # so warn that this list can differ from the browser's
+        try:
+            from urllib.parse import urlparse, parse_qs
+            list_id = parse_qs(urlparse(source_url).query).get("list", [""])[0]
+        except Exception:
+            list_id = ""
+        if list_id.startswith("RD"):
+            tk.Label(body,
+                     text="Note: this is an auto-generated YouTube Mix. YouTube "
+                          "builds it fresh\neach time, so it may not exactly match "
+                          "the list in your browser.",
+                     font=FONT_SMALL, bg=BG_MAIN, fg=FG_WARN, justify="left",
+                     anchor="w").pack(fill="x", pady=(2, 0))
+
+        # Make it obvious what "Just this video" will grab
+        primary_row = next(
+            (r for r in rows if primary_url and r["url"] == primary_url), None)
+        target_row = primary_row or rows[0]
+        prefix = "Your video: " if primary_row else "First video: "
+        tk.Label(body, text=prefix + target_row["title"][:62],
+                 font=FONT_SMALL, bg=BG_MAIN, fg=FG_ACCENT,
+                 anchor="w").pack(fill="x", pady=(2, 6))
+
+        # Quick filter: narrows the list as you type; selections persist
+        filter_row = tk.Frame(body, bg=BG_MAIN)
+        filter_row.pack(fill="x", pady=(0, 4))
+        filt = RoundField(filter_row, height=30)
+        filt.pack(side="left", fill="x", expand=True)
+        clear_btn = tk.Label(filter_row, text="✕", font=FONT_SMALL, bg=BG_MAIN,
+                             fg=FG_DIM, cursor="hand2", padx=8)
+        clear_btn.pack(side="right")
+        clear_btn.bind("<Enter>", lambda e: clear_btn.config(fg=FG_TEXT))
+        clear_btn.bind("<Leave>", lambda e: clear_btn.config(fg=FG_DIM))
+
+        wrap, inner = self._scroll_area(body, height=min(340, 30 * len(rows) + 10))
+        wrap.pack(fill="both", expand=True)
+        list_canvas = inner.master
+
+        variables = []
+        row_widgets = []
+
+        def update_count(*_):
+            n = sum(var.get() for var in variables)
+            count_lbl.config(text=f"{n} of {len(rows)} selected")
+
+        # Shift+click selects the whole range since the last clicked box
+        anchor = {"i": 0}
+
+        def on_row_click(i):
+            anchor["i"] = i
+            update_count()
+
+        def on_shift_click(i):
+            vis = visible_indices()
+            if i not in vis:
+                return "break"
+            a = anchor["i"] if anchor["i"] in vis else i
+            ai, bi = vis.index(a), vis.index(i)
+            state = not variables[i].get()
+            for j in vis[min(ai, bi):max(ai, bi) + 1]:
+                variables[j].set(state)
+            anchor["i"] = i
+            update_count()
+            return "break"
+
+        for i, r in enumerate(rows):
+            var = tk.BooleanVar(value=True)
+            variables.append(var)
+            is_primary = primary_url and r["url"] == primary_url
+            label = f"{i + 1:>3}.  {r['title'][:58]}"
+            if r["duration"]:
+                label += f"  ({r['duration']})"
+            if is_primary:
+                label += "   (your link)"
+            cb = tk.Checkbutton(
+                inner, text=label, variable=var, font=FONT_SMALL,
+                bg=BG_MAIN, fg=FG_ACCENT if is_primary else FG_TEXT,
+                activebackground=BG_MAIN, activeforeground=FG_TEXT,
+                selectcolor=BG_INPUT, highlightthickness=0, bd=0, anchor="w",
+                command=lambda i=i: on_row_click(i),
+            )
+            cb.bind("<Shift-Button-1>", lambda e, i=i: on_shift_click(i))
+            cb.pack(fill="x", padx=2)
+            row_widgets.append((cb, f"{r['title']} {r['uploader']}".lower()))
+
+        def visible_indices():
+            query = filt.entry.get().strip().lower()
+            return [i for i, (cb, text) in enumerate(row_widgets)
+                    if not query or query in text]
+
+        def refilter(*_):
+            show = set(visible_indices())
+            for i, (cb, text) in enumerate(row_widgets):
+                cb.pack_forget()
+            for i, (cb, text) in enumerate(row_widgets):
+                if i in show:
+                    cb.pack(fill="x", padx=2)
+            list_canvas.yview_moveto(0)
+
+        filt.entry.bind("<KeyRelease>", refilter)
+
+        def clear_filter(event=None):
+            filt.entry.delete(0, tk.END)
+            refilter()
+
+        clear_btn.bind("<Button-1>", clear_filter)
+
+        toggles = tk.Frame(body, bg=BG_MAIN)
+        toggles.pack(fill="x", pady=(6, 0))
+
+        def set_all(value):
+            # All/None act on the rows currently shown by the filter
+            for i in visible_indices():
+                variables[i].set(value)
+            update_count()
+
+        for text, val in (("All", True), ("None", False)):
+            lbl = tk.Label(toggles, text=text, font=FONT_SMALL, bg=BG_MAIN,
+                           fg=FG_ACCENT, cursor="hand2")
+            lbl.pack(side="left", padx=(0, 12))
+            lbl.bind("<Button-1>", lambda e, v=val: set_all(v))
+
+        count_lbl = tk.Label(toggles, text="", font=FONT_SMALL,
+                             bg=BG_MAIN, fg=FG_LABEL)
+        count_lbl.pack(side="right")
+        update_count()
+        filt.entry.focus_set()
+
+        # Per-batch options: how to run it, and which details to use.
+        # The batch mode is remembered; the details override is per-batch.
+        mode_var = tk.StringVar(
+            value="review" if self.config.playlist_review else "auto")
+        src_var = tk.StringVar(value="default")
+
+        def save_mode():
+            self.config.playlist_review = (mode_var.get() == "review")
+            self.config.save()
+
+        def opt_row(label, var, options, cmd=None):
+            rowf = tk.Frame(body, bg=BG_MAIN)
+            rowf.pack(fill="x", pady=(6, 0))
+            tk.Label(rowf, text=label, font=FONT_SMALL, bg=BG_MAIN,
+                     fg=FG_LABEL, width=7, anchor="w").pack(side="left")
+            for text, value in options:
+                tk.Radiobutton(
+                    rowf, text=text, variable=var, value=value,
+                    font=FONT_SMALL, bg=BG_MAIN, fg=FG_TEXT,
+                    selectcolor=BG_INPUT, activebackground=BG_MAIN,
+                    activeforeground=FG_TEXT, highlightthickness=0, bd=0,
+                    command=cmd,
+                ).pack(side="left", padx=(0, 10))
+
+        opt_row("Batch:", mode_var,
+                [("Download automatically", "auto"),
+                 ("Review each one", "review")], cmd=save_mode)
+        opt_row("Details:", src_var,
+                [("My defaults", "default"), ("iTunes", "itunes"),
+                 ("YouTube", "youtube")])
+
+        btns = tk.Frame(body, bg=BG_MAIN)
+        btns.pack(fill="x", pady=(10, 0))
+
+        def download_selected():
+            selected = [r["url"] for r, var in zip(rows, variables) if var.get()]
+            review = mode_var.get() == "review"
+            source = None if src_var.get() == "default" else src_var.get()
+            win.destroy()
+            if not selected:
+                return
+            if len(selected) == 1 and not review and source is None:
+                self._fetch_single(selected[0])
+            else:
+                self._start_queue(selected, review=review, source=source)
+
+        def just_one():
+            win.destroy()
+            self._fetch_single(primary_url or rows[0]["url"])
+
+        self._make_button(
+            btns, "Download selected", download_selected,
+            BG_BUTTON_ACCENT, FG_BUTTON_ACCENT, BG_BUTTON_ACCENT_HOVER,
+        ).pack(side="left")
+        self._make_button(
+            btns, "Just this video" if primary_url else "Just the first one",
+            just_one, BG_BUTTON, FG_TEXT, BG_BUTTON_HOVER,
+        ).pack(side="left", padx=(8, 0))
+        self._make_button(
+            btns, "Cancel", win.destroy,
+            BG_BUTTON, FG_TEXT, BG_BUTTON_HOVER,
+        ).pack(side="right")
+
+    def _start_queue(self, urls, review=False, source=None):
+        self._queue = list(urls)
+        self._queue_total = len(self._queue)
+        self._queue_running = True
+        self._queue_review = review
+        self._queue_source = source
+        self._queue_album_hint = None
+        mode = "review each one" if review else "download automatically"
+        self._status_bar.append(
+            f"Queue started: {self._queue_total} videos ({mode}).", "info")
+        self._next_in_queue()
+
+    def _next_in_queue(self):
+        if not self._queue:
+            return
+        url = self._queue.pop(0)
+        n = self._queue_total - len(self._queue)
+        self._status_bar.append(f"Queue {n}/{self._queue_total}:", "info")
+        self._fetch_single(url)
+
+    def _finish_queue(self, message, tag):
+        self._queue = []
+        self._queue_running = False
+        self._queue_review = False
+        self._queue_source = None
+        self._queue_album_hint = None
+        self._queue_total = 0
+        self._show_skip(False)
+        self._status_bar.append(message, tag)
+
+    def _show_skip(self, show: bool):
+        if show and not self._skip_btn.winfo_ismapped():
+            self._skip_btn.pack(side="left", padx=(8, 0),
+                                before=self._history_btn)
+            self._cancel_batch_btn.pack(side="left", padx=(8, 0),
+                                        before=self._history_btn)
+        elif not show and self._skip_btn.winfo_ismapped():
+            self._skip_btn.pack_forget()
+            self._cancel_batch_btn.pack_forget()
+
+    def _cancel_batch(self):
+        if self._queue_running:
+            self._finish_queue("Batch cancelled.", "warning")
+
+    def _skip_current(self):
+        """Review mode: skip the current song without downloading it."""
+        if not self._queue_running:
+            return
+        self._show_skip(False)
+        self._status_bar.append("Skipped.", "dim")
+        self._queue_advance_or_finish()
+
+    def _queue_advance_or_finish(self):
+        if self._queue:
+            self.after(500, self._next_in_queue)
+        else:
+            self._finish_queue("Queue finished.", "success")
+
+    def _make_tooltip(self, widget, text):
+        """Show a themed tooltip under the widget after a short hover delay.
+
+        `text` may be a string or a zero-arg callable resolved at show time.
+        """
         state = {"win": None, "job": None}
 
         def show():
@@ -1108,7 +2100,7 @@ class YTYoinkApp(tk.Tk):
             tw = tk.Toplevel(self)
             tw.wm_overrideredirect(True)
             tk.Label(
-                tw, text=text, font=FONT_SMALL,
+                tw, text=text() if callable(text) else text, font=FONT_SMALL,
                 bg=BG_SECTION, fg=FG_TEXT, justify="left",
                 highlightbackground=BORDER_COLOR, highlightcolor=BORDER_COLOR,
                 highlightthickness=1, padx=8, pady=5,
@@ -1143,16 +2135,10 @@ class YTYoinkApp(tk.Tk):
             self._settings_win.focus_set()
             return
 
-        win = tk.Toplevel(self)
-        win.title("Settings")
-        win.configure(bg=BG_SECTION)
-        win.resizable(False, False)
-        win.transient(self)
-        win.geometry(f"+{self.winfo_rootx() + self.winfo_width() - 300}+{self.winfo_rooty() + 50}")
+        win, body = self._make_popup("Settings", body_bg=BG_SECTION)
+        win.geometry(f"+{self.winfo_rootx() + self.winfo_width() - 320}"
+                     f"+{self.winfo_rooty() + 50}")
         self._settings_win = win
-
-        body = tk.Frame(win, bg=BG_SECTION, padx=14, pady=12)
-        body.pack(fill="both", expand=True)
 
         def section(text, first=False):
             tk.Label(
@@ -1173,8 +2159,14 @@ class YTYoinkApp(tk.Tk):
                 ).pack(side="left", padx=(0, 10))
 
         section("Output format", first=True)
-        radio_row([("M4A (AAC 256kbps)", "m4a"), ("MP3 (VBR Q0)", "mp3")],
+        radio_row([("M4A (AAC 256kbps)", "m4a"), ("MP3 (VBR Q0)", "mp3"),
+                   ("Opus (original)", "opus")],
                   self._format_var, self._on_format_change)
+        tk.Label(
+            body, text="Opus keeps YouTube's original audio with no re-encode.\n"
+                       "Use M4A for iPhone and iTunes.",
+            font=FONT_SMALL, bg=BG_SECTION, fg=FG_DIM, justify="left",
+        ).pack(anchor="w", pady=(2, 0))
 
         section("Preferred metadata")
         radio_row([("iTunes", "itunes"), ("YouTube", "youtube")],
@@ -1183,6 +2175,31 @@ class YTYoinkApp(tk.Tk):
         section("Preferred artwork")
         radio_row([("iTunes", "itunes"), ("YouTube", "youtube")],
                   self._pref_artwork_var, self._on_pref_artwork_change)
+
+        section("Playlist links")
+        tk.Checkbutton(
+            body, text="Ask what to download from playlists",
+            variable=self._ask_playlist_var, font=FONT_SMALL,
+            bg=BG_SECTION, fg=FG_TEXT, selectcolor=BG_INPUT,
+            activebackground=BG_SECTION, activeforeground=FG_TEXT,
+            highlightthickness=0, bd=0,
+            command=self._on_ask_playlist_change,
+        ).pack(anchor="w")
+        tk.Checkbutton(
+            body, text="Ignore auto-generated Mixes (radio links)",
+            variable=self._ignore_mixes_var, font=FONT_SMALL,
+            bg=BG_SECTION, fg=FG_TEXT, selectcolor=BG_INPUT,
+            activebackground=BG_SECTION, activeforeground=FG_TEXT,
+            highlightthickness=0, bd=0,
+            command=self._on_ignore_mixes_change,
+        ).pack(anchor="w")
+        tk.Label(
+            body, text="Mix links (RD...) always grab just the pasted video\n"
+                       "when ignored; real playlists and albums still ask.\n"
+                       "With Turbo on and asking on, Turbo downloads the\n"
+                       "whole playlist.",
+            font=FONT_SMALL, bg=BG_SECTION, fg=FG_DIM, justify="left",
+        ).pack(anchor="w", pady=(2, 0))
 
     def _on_format_change(self):
         self.config.format = self._format_var.get()
@@ -1395,15 +2412,7 @@ class YTYoinkApp(tk.Tk):
             self._status_bar.append("Download folder not set or does not exist.", "warning")
 
     def _on_last_dl_click(self, event=None):
-        if not self._last_download_path:
-            return
-        # explorer needs backslashes — forward slashes send it to Documents
-        path = os.path.normpath(self._last_download_path)
-        if os.path.isfile(path):
-            subprocess.run(["explorer", "/select," + path])
-        elif os.path.isdir(os.path.dirname(path)):
-            # File may have been moved (e.g. iTunes auto-import) — open folder
-            os.startfile(os.path.dirname(path))
+        self._reveal_file(self._last_download_path)
 
     def _on_open_after_change(self):
         self.config.open_after_download = self._open_after_var.get()
@@ -1419,7 +2428,10 @@ class YTYoinkApp(tk.Tk):
             return
 
         self._set_ui_state("downloading")
-        self._status_bar.clear()
+        self._show_skip(False)
+        if not self._queue_running:
+            # Keep the running queue narrative visible across items
+            self._status_bar.clear()
         self._progress_var.set(0)
 
         # Always pass all field values so the pipeline uses exactly what's shown
@@ -1491,12 +2503,17 @@ class YTYoinkApp(tk.Tk):
         self._status_bar.append("Download complete.", "success")
         self._progress_var.set(100)
         self._set_ui_state("ready")
+        self._append_history(result.filename, result.output_path,
+                             self._current_url)
 
         if self._open_after_var.get() and os.path.isfile(result.output_path):
             try:
                 os.startfile(result.output_path)
             except Exception:
                 pass
+
+        if self._queue_running:
+            self._queue_advance_or_finish()
 
     def _on_download_cancelled(self):
         self._status_bar.append("Download cancelled.", "warning")
@@ -1507,8 +2524,16 @@ class YTYoinkApp(tk.Tk):
         self._status_bar.append(f"Error: {error_msg}", "error")
         self._progress_var.set(0)
         self._set_ui_state("ready")
+        if self._queue_running:
+            if self._queue:
+                self._status_bar.append("Skipping to the next video in the queue...", "warning")
+                self.after(600, self._next_in_queue)
+            else:
+                self._finish_queue("Queue finished (last video failed).", "warning")
 
     def _on_cancel(self):
+        if self._queue_running:
+            self._finish_queue("Queue cancelled.", "warning")
         self.pipeline.cancel()
         self._cancel_btn.config(state="disabled")
         self._status_bar.append("Cancelling...", "warning")
@@ -1522,6 +2547,7 @@ class YTYoinkApp(tk.Tk):
     # ---- UI state ----
 
     def _set_ui_state(self, state):
+        self._ui_state = state
         states = {
             "idle":        ("normal",   "normal",   "disabled", "disabled"),
             "fetching":    ("disabled", "disabled", "disabled", "disabled"),
@@ -1530,6 +2556,7 @@ class YTYoinkApp(tk.Tk):
         }
         fetch, url, dl, cancel = states.get(state, states["idle"])
         self._fetch_btn.config(state=fetch, cursor="hand2" if fetch == "normal" else "")
+        self._search_btn.config(state=fetch, cursor="hand2" if fetch == "normal" else "")
         self._url_entry.config(state=url)
         self._download_btn.config(state=dl, cursor="hand2" if dl == "normal" else "")
         self._cancel_btn.config(state=cancel, cursor="hand2" if cancel == "normal" else "")
@@ -1538,6 +2565,20 @@ class YTYoinkApp(tk.Tk):
 
     def run_startup_tasks(self):
         def worker():
+            # Surface a crash from the previous session, once
+            crash_path = os.path.join(app_dir(), "crash.log")
+            try:
+                if os.path.isfile(crash_path) and os.path.getsize(crash_path) > 0:
+                    self.after(0, self._status_bar.append,
+                               "The previous session hit an error. Details are in "
+                               "crash.log next to the app.", "warning")
+                    old = crash_path + ".old"
+                    if os.path.exists(old):
+                        os.remove(old)
+                    os.rename(crash_path, old)
+            except OSError:
+                pass
+
             # Clean up stale temp folders from previous runs (respects locks)
             from downloader import cleanup_stale_temp
             removed = cleanup_stale_temp()
@@ -1572,6 +2613,7 @@ class YTYoinkApp(tk.Tk):
             update_ytdlp(status_callback=cb)
             self._deps_ready = True
             self.after(0, self._fetch_btn.config, state="normal", cursor="hand2")
+            self.after(0, self._search_btn.config, state="normal", cursor="hand2")
             self.after(0, self._status_bar.append, "Ready.", "success")
 
         threading.Thread(target=worker, daemon=True).start()

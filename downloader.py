@@ -110,6 +110,71 @@ class DownloadResult:
     cover_source_used: str
 
 
+def _flat_entries(data: dict) -> list[dict]:
+    """Convert yt-dlp flat-playlist JSON entries to simple row dicts."""
+    rows = []
+    for e in data.get("entries") or []:
+        vid = e.get("id")
+        if not vid:
+            continue
+        dur = e.get("duration")
+        if dur:
+            m, s = divmod(int(dur), 60)
+            dur_str = f"{m}:{s:02d}"
+        else:
+            dur_str = ""
+        rows.append({
+            "url": f"https://www.youtube.com/watch?v={vid}",
+            "id": vid,
+            "title": e.get("title") or "(untitled)",
+            "uploader": e.get("uploader") or e.get("channel") or "",
+            "duration": dur_str,
+        })
+    return rows
+
+
+def search_youtube(query: str, limit: int = 8) -> list[dict]:
+    """Search YouTube by name via yt-dlp. Returns row dicts (see _flat_entries)."""
+    result = subprocess.run(
+        ["yt-dlp", "--flat-playlist", "-J", f"ytsearch{limit}:{query}"],
+        capture_output=True, text=True, timeout=30,
+        creationflags=CREATE_NO_WINDOW,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip()[:200] or "search failed")
+    return _flat_entries(json.loads(result.stdout))
+
+
+def list_playlist(url: str, limit: int = 100) -> tuple[str, list[dict]]:
+    """List playlist entries without downloading. Returns (title, rows)."""
+    result = subprocess.run(
+        ["yt-dlp", "--flat-playlist", "-J", "--playlist-items", f"1:{limit}", url],
+        capture_output=True, text=True, timeout=60,
+        creationflags=CREATE_NO_WINDOW,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip()[:200] or "could not read playlist")
+    data = json.loads(result.stdout)
+    return data.get("title") or "Playlist", _flat_entries(data)
+
+
+def _ogg_picture_b64(image_path: str) -> str:
+    """Build a base64 METADATA_BLOCK_PICTURE (front cover) for Ogg/Opus tags."""
+    import base64
+    import struct
+    with open(image_path, "rb") as f:
+        img = f.read()
+    mime = b"image/png" if img[:8] == b"\x89PNG\r\n\x1a\n" else b"image/jpeg"
+    block = (
+        struct.pack(">I", 3)                     # picture type: front cover
+        + struct.pack(">I", len(mime)) + mime
+        + struct.pack(">I", 0)                   # empty description
+        + struct.pack(">IIII", 0, 0, 0, 0)       # width/height/depth/colors
+        + struct.pack(">I", len(img)) + img
+    )
+    return base64.b64encode(block).decode("ascii")
+
+
 def sanitize_filename(name: str) -> str:
     """Remove characters invalid in Windows filenames."""
     name = re.sub(r'[\\/:*?"<>|]', "", name).strip()
@@ -469,7 +534,7 @@ class DownloadPipeline:
 
         # Build output filename from final tags
         self._check_cancel()
-        final_ext = "mp3" if self.config.format == "mp3" else "m4a"
+        final_ext = {"mp3": "mp3", "opus": "opus"}.get(self.config.format, "m4a")
 
         if tag_artist and tag_title:
             base_name = f"{tag_artist} - {tag_title}"
@@ -672,6 +737,10 @@ class DownloadPipeline:
         duration: int = 0,
     ) -> None:
         """Encode the final audio file with embedded metadata and cover art."""
+        if fmt == "opus":
+            self._encode_opus(raw_audio, png_path, has_cover, output_path,
+                              tags, duration)
+            return
         ff_args = ["ffmpeg", "-y", "-v", "quiet", "-i", raw_audio]
 
         if has_cover:
@@ -701,9 +770,55 @@ class DownloadPipeline:
             if value or key == "comment":
                 ff_args += ["-metadata", f"{key}={value}"]
 
-        # Progress reporting on stdout; -v quiet keeps stderr to errors only
-        ff_args += ["-progress", "pipe:1", "-nostats"]
-        ff_args.append(output_path)
+        rc, err = self._run_ffmpeg(ff_args, output_path, duration)
+        if rc != 0:
+            raise RuntimeError(f"ffmpeg failed: {err[:500]}")
+
+    def _encode_opus(self, raw_audio, png_path, has_cover, output_path,
+                     tags, duration) -> None:
+        """Opus passthrough: remux the original audio stream untouched.
+
+        Tags and cover art go in as Vorbis comments via an ffmetadata file
+        (the cover is a METADATA_BLOCK_PICTURE — too large for the command
+        line). Falls back to one libopus re-encode if the source stream
+        isn't opus/vorbis and can't be copied into an Ogg container.
+        """
+        def esc(value):
+            return re.sub(r"([=;#\\\n])", r"\\\1", value)
+
+        lines = [";FFMETADATA1"]
+        for key, value in tags.items():
+            if value:
+                lines.append(f"{key}={esc(value)}")
+        meta_path = os.path.join(os.path.dirname(raw_audio), "_opus_tags.txt")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        base = ["ffmpeg", "-y", "-v", "quiet", "-i", raw_audio,
+                "-f", "ffmetadata", "-i", meta_path,
+                "-map_metadata", "1", "-map", "0:a:0"]
+        rc, err = self._run_ffmpeg(base + ["-c:a", "copy"], output_path, duration)
+        if rc != 0:
+            rc, err = self._run_ffmpeg(
+                base + ["-c:a", "libopus", "-b:a", "192k"], output_path, duration)
+        if rc != 0:
+            raise RuntimeError(f"ffmpeg failed: {err[:500]}")
+
+        # ffmpeg's ogg muxer drops METADATA_BLOCK_PICTURE, so the cover
+        # goes in afterwards via mutagen. Cover-less files are still fine.
+        if has_cover:
+            try:
+                from mutagen.oggopus import OggOpus
+                audio = OggOpus(output_path)
+                audio["metadata_block_picture"] = [_ogg_picture_b64(png_path)]
+                audio.save()
+            except Exception:
+                self._status("Note: could not embed cover art in the Opus file.")
+
+    def _run_ffmpeg(self, ff_args, output_path, duration) -> tuple[int, str]:
+        """Run ffmpeg with live encode progress, cancel support, and an
+        anti-hang watchdog scaled to track length."""
+        ff_args = list(ff_args) + ["-progress", "pipe:1", "-nostats", output_path]
 
         process = subprocess.Popen(
             ff_args,
@@ -713,8 +828,6 @@ class DownloadPipeline:
             creationflags=CREATE_NO_WINDOW,
         )
 
-        # Anti-hang watchdog, scaled to track length (old flat 120s timeout
-        # failed legitimately long encodes). Only fires if ffmpeg truly hangs.
         watchdog = Timer(max(300, duration * 3), process.kill)
         watchdog.start()
         try:
@@ -734,13 +847,13 @@ class DownloadPipeline:
             watchdog.cancel()
             process.wait()
 
+        stderr_text = ""
         if process.returncode != 0:
-            stderr_text = ""
             try:
                 stderr_text = process.stderr.read() or ""
             except Exception:
                 pass
-            raise RuntimeError(f"ffmpeg failed: {stderr_text[:500]}")
+        return process.returncode, stderr_text
 
     def _prune_old_runs(self) -> None:
         """Remove stale run folders older than 1 day, skipping locked ones."""
