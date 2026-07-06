@@ -122,25 +122,56 @@ def _flat_entries(data: dict) -> list[dict]:
             continue
         dur = e.get("duration")
         if dur:
-            m, s = divmod(int(dur), 60)
-            dur_str = f"{m}:{s:02d}"
+            hours, rem = divmod(int(dur), 3600)
+            m, s = divmod(rem, 60)
+            dur_str = f"{hours}:{m:02d}:{s:02d}" if hours else f"{m}:{s:02d}"
         else:
             dur_str = ""
+        views = e.get("view_count")
+        if views is not None:
+            views = int(views)
+            if views >= 1_000_000:
+                views_str = f"{views / 1_000_000:.1f}M views".replace(".0M", "M")
+            elif views >= 1_000:
+                views_str = f"{views / 1_000:.1f}K views".replace(".0K", "K")
+            else:
+                views_str = f"{views} views"
+        else:
+            views_str = ""
         rows.append({
             "url": f"https://www.youtube.com/watch?v={vid}",
             "id": vid,
             "title": e.get("title") or "(untitled)",
             "uploader": e.get("uploader") or e.get("channel") or "",
             "duration": dur_str,
+            "views": views_str,
         })
     return rows
 
 
-def search_youtube(query: str, limit: int = 8) -> list[dict]:
-    """Search YouTube by name via yt-dlp. Returns row dicts (see _flat_entries)."""
+# YouTube search-URL filter tokens (the "sp" parameter)
+DURATION_FILTERS = {"short": "EgIYAQ==",    # under 4 minutes
+                    "medium": "EgIYAw==",   # 4 to 20 minutes
+                    "long": "EgIYAg=="}     # over 20 minutes
+
+
+def search_youtube(query: str, limit: int = 100,
+                   duration: str | None = None) -> list[dict]:
+    """Search YouTube by name via yt-dlp. Returns row dicts (see
+    _flat_entries). `duration` narrows server-side: "short" (<4 min),
+    "medium" (4-20 min), or "long" (>20 min)."""
+    token = DURATION_FILTERS.get(duration or "")
+    if token:
+        import urllib.parse
+        target = ("https://www.youtube.com/results?"
+                  + urllib.parse.urlencode({"search_query": query,
+                                            "sp": token}))
+        args = ["yt-dlp", "--flat-playlist", "-J",
+                "--playlist-items", f"1:{limit}", target]
+    else:
+        args = ["yt-dlp", "--flat-playlist", "-J", f"ytsearch{limit}:{query}"]
     result = subprocess.run(
-        ["yt-dlp", "--flat-playlist", "-J", f"ytsearch{limit}:{query}"],
-        capture_output=True, text=True, timeout=30,
+        args, capture_output=True, text=True, timeout=45,
         creationflags=CREATE_NO_WINDOW,
     )
     if result.returncode != 0:

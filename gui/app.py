@@ -26,7 +26,7 @@ from gui.styles import (
 )
 from gui.widgets import (
     CheckboxEntry, CollapsibleStatus, CoverTile, ImagePreview, RoundButton,
-    RoundField,
+    RoundField, monitor_bounds,
 )
 
 try:
@@ -1470,14 +1470,44 @@ class YTYoinkApp(tk.Tk):
         field.pack(side="left", fill="x", expand=True, padx=(0, 8))
         field.config(width=400)
 
+        # Length filter — applied by YouTube itself on the next Search
+        dur_var = tk.StringVar(value="any")
+        len_row = tk.Frame(body, bg=BG_MAIN)
+        len_row.pack(fill="x", pady=(6, 0))
+        tk.Label(len_row, text="Length:", font=FONT_SMALL, bg=BG_MAIN,
+                 fg=FG_DIM).pack(side="left", padx=(0, 6))
+        for text, value in (("Any", "any"), ("Under 4 min", "short"),
+                            ("4-20 min", "medium"), ("Over 20 min", "long")):
+            tk.Radiobutton(
+                len_row, text=text, variable=dur_var, value=value,
+                font=FONT_SMALL, bg=BG_MAIN, fg=FG_TEXT,
+                selectcolor=BG_INPUT, activebackground=BG_MAIN,
+                activeforeground=FG_TEXT, highlightthickness=0, bd=0,
+            ).pack(side="left", padx=(0, 8))
+
+        # Live filter over the returned results
+        filt_row = tk.Frame(body, bg=BG_MAIN)
+        filt_row.pack(fill="x", pady=(4, 0))
+        tk.Label(filt_row, text="Filter:", font=FONT_SMALL, bg=BG_MAIN,
+                 fg=FG_DIM).pack(side="left", padx=(0, 6))
+        filt_field = RoundField(filt_row, height=26)
+        filt_field.pack(side="left", fill="x", expand=True)
+
         info = tk.Label(body, text="Type a song or artist and hit Enter.",
                         font=FONT_SMALL, bg=BG_MAIN, fg=FG_DIM, anchor="w")
-        results = tk.Frame(body, bg=BG_MAIN)
+        info.pack(fill="x", pady=(8, 2))
+        results_wrap, results = self._scroll_area(body, height=360)
+        results_wrap.pack(fill="both", expand=True)
 
         def set_row_bg(frame, color):
             frame.config(bg=color)
             for child in frame.winfo_children():
                 child.config(bg=color)
+
+        def fold(s):
+            import unicodedata
+            return "".join(ch for ch in unicodedata.normalize("NFKD", s or "")
+                           if not unicodedata.combining(ch)).lower()
 
         def pick(url):
             if self._ui_state in ("fetching", "downloading"):
@@ -1490,26 +1520,218 @@ class YTYoinkApp(tk.Tk):
             self._url_entry.insert(0, url)
             self._on_fetch_info()
 
+        all_rows = []
+        thumb_labels = []          # (label, video_id) still needing an image
+        thumb_bytes = {}           # video_id -> jpg bytes (survives filtering)
+        thumb_photos = {}          # video_id -> PhotoImage (prevents GC)
+        loader_gen = [0]           # bumping this retires stale loader threads
+
+        def set_thumb(label, vid):
+            data = thumb_bytes.get(vid)
+            if not data:
+                return False
+            try:
+                photo = thumb_photos.get(vid)
+                if photo is None:
+                    import io
+                    img = Image.open(io.BytesIO(data)).resize(
+                        (64, 36), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    thumb_photos[vid] = photo
+                label.config(image=photo, width=64, height=36)
+                return True
+            except Exception:
+                return False
+
+        def load_thumbs():
+            # Fetch missing thumbnails in the background with a small pool —
+            # rows appear instantly, pictures stream in
+            gen = loader_gen[0]
+            import queue
+            jobs = queue.Queue()
+            for item in thumb_labels:
+                jobs.put(item)
+
+            def fetch_worker():
+                while gen == loader_gen[0] and win.winfo_exists():
+                    try:
+                        lbl, vid = jobs.get_nowait()
+                    except queue.Empty:
+                        return
+                    if vid not in thumb_bytes:
+                        data = self.pipeline.download_cover_bytes(
+                            f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg")
+                        if not data:
+                            continue
+                        thumb_bytes[vid] = data
+                    self.after(0, lambda l=lbl, v=vid: (
+                        win.winfo_exists() and set_thumb(l, v)))
+
+            for _ in range(6):
+                threading.Thread(target=fetch_worker, daemon=True).start()
+
+        # Hover zoom on thumbnails — same feel as the artwork tiles
+        zoom = {"win": None, "job": None, "photo": None}
+
+        def hide_zoom(event=None):
+            if zoom["job"]:
+                try:
+                    self.after_cancel(zoom["job"])
+                except Exception:
+                    pass
+                zoom["job"] = None
+            if zoom["win"] is not None:
+                try:
+                    zoom["win"].destroy()
+                except Exception:
+                    pass
+                zoom["win"] = None
+                zoom["photo"] = None
+
+        def show_zoom(label, vid):
+            zoom["job"] = None
+            if zoom["win"] is not None or not win.winfo_exists():
+                return
+            if not label.winfo_exists():
+                return
+            data = thumb_bytes.get(vid)
+            if not data:
+                return
+            import io
+            from PIL import ImageDraw
+            try:
+                img = Image.open(io.BytesIO(data)).convert("RGBA")
+            except Exception:
+                return
+            w_z = 380
+            h_z = max(1, int(w_z * img.height / img.width))
+            img = img.resize((w_z, h_z), Image.LANCZOS)
+            ss, radius = 4, 14
+            mask = Image.new("L", (w_z * ss, h_z * ss), 0)
+            ImageDraw.Draw(mask).rounded_rectangle(
+                (0, 0, w_z * ss - 1, h_z * ss - 1), radius=radius * ss,
+                fill=255)
+            img.putalpha(mask.resize((w_z, h_z), Image.LANCZOS))
+            ring = Image.new("RGBA", (w_z * ss, h_z * ss), (0, 0, 0, 0))
+            ImageDraw.Draw(ring).rounded_rectangle(
+                (ss, ss, w_z * ss - 1 - ss, h_z * ss - 1 - ss),
+                radius=radius * ss, outline=BORDER_COLOR, width=2 * ss)
+            img.alpha_composite(ring.resize((w_z, h_z), Image.LANCZOS))
+            zoom["photo"] = ImageTk.PhotoImage(img)
+
+            tw = tk.Toplevel(win)
+            tw.wm_overrideredirect(True)
+            tw.attributes("-topmost", True)
+            key = "#010203"
+            tw.configure(bg=key)
+            try:
+                tw.attributes("-transparentcolor", key)
+            except tk.TclError:
+                pass
+            tk.Label(tw, image=zoom["photo"], bg=key, bd=0).pack()
+
+            left, top, right, bottom = monitor_bounds(label)
+            lx, ly = label.winfo_rootx(), label.winfo_rooty()
+            lh = label.winfo_height()
+            x = lx + label.winfo_width() // 2 - w_z // 2
+            x = max(left + 8, min(x, right - w_z - 8))
+            if bottom - (ly + lh) - 16 >= h_z:
+                y = ly + lh + 10
+            elif ly - top - 16 >= h_z:
+                y = ly - h_z - 10
+            else:
+                x = min(lx + label.winfo_width() + 12, right - w_z - 8)
+                y = max(top + 8, min(ly, bottom - h_z - 8))
+            tw.wm_geometry(f"+{x}+{y}")
+            zoom["win"] = tw
+
+        def schedule_zoom(label, vid):
+            if zoom["win"] is not None:
+                return
+            if zoom["job"]:
+                try:
+                    self.after_cancel(zoom["job"])
+                except Exception:
+                    pass
+            zoom["job"] = self.after(350, lambda: show_zoom(label, vid))
+
+        def render(rows):
+            loader_gen[0] += 1
+            hide_zoom()
+            for child in results.winfo_children():
+                child.destroy()
+            thumb_labels.clear()
+            for r in rows:
+                rowf = tk.Frame(results, bg=BG_SECTION, padx=8, pady=5,
+                                highlightbackground=BORDER_COLOR,
+                                highlightthickness=1, cursor="hand2")
+                rowf.pack(fill="x", pady=2)
+                thumb = tk.Label(rowf, bg=BG_INPUT, width=9, height=2)
+                thumb.pack(side="left", padx=(0, 10))
+                if not set_thumb(thumb, r["id"]):
+                    thumb_labels.append((thumb, r["id"]))
+                text = tk.Frame(rowf, bg=BG_SECTION)
+                text.pack(side="left", fill="x", expand=True)
+                tk.Label(text, text=r["title"][:70], font=FONT_LABEL,
+                         bg=BG_SECTION, fg=FG_TEXT, anchor="w").pack(fill="x")
+                sub = "  ·  ".join(x for x in (r["uploader"], r["duration"],
+                                               r.get("views", "")) if x)
+                tk.Label(text, text=sub, font=FONT_SMALL,
+                         bg=BG_SECTION, fg=FG_DIM, anchor="w").pack(fill="x")
+                for w in (rowf, thumb, text, *text.winfo_children()):
+                    w.bind("<Button-1>", lambda e, u=r["url"]: pick(u))
+                    w.bind("<Enter>", lambda e, f=rowf: set_row_bg(f, BG_INPUT))
+                    w.bind("<Leave>", lambda e, f=rowf: set_row_bg(f, BG_SECTION))
+                # thumbnail hover shows the enlarged preview
+                thumb.bind("<Enter>",
+                           lambda e, l=thumb, v=r["id"]: schedule_zoom(l, v),
+                           add="+")
+                thumb.bind("<Leave>", hide_zoom, add="+")
+                thumb.bind("<Button-1>", hide_zoom, add="+")
+                # open the video in the default browser (does not fetch)
+                link = tk.Label(text, text="Open in browser", font=FONT_SMALL,
+                                bg=BG_SECTION, fg=FG_ACCENT, cursor="hand2",
+                                anchor="w")
+                link.pack(fill="x")
+
+                def open_browser(event, u=r["url"]):
+                    import webbrowser
+                    webbrowser.open(u)
+                    return "break"
+
+                link.bind("<Button-1>", open_browser)
+                link.bind("<Enter>", lambda e, f=rowf, l=link:
+                          (set_row_bg(f, BG_INPUT), l.config(fg=FG_TEXT)))
+                link.bind("<Leave>", lambda e, f=rowf, l=link:
+                          (set_row_bg(f, BG_SECTION), l.config(fg=FG_ACCENT)))
+            if thumb_labels:
+                load_thumbs()
+
+        def apply_filter(*_):
+            q = fold(filt_field.entry.get().strip())
+            subset = [r for r in all_rows
+                      if not q or q in fold(r["title"] + " " + r["uploader"])]
+            render(subset)
+            if all_rows:
+                if len(subset) != len(all_rows):
+                    info.config(text=f"{len(subset)} of {len(all_rows)} "
+                                     "match your filter:", fg=FG_DIM)
+                else:
+                    info.config(text=f"{len(all_rows)} results. "
+                                     "Click one to fetch it:", fg=FG_DIM)
+
+        filt_field.entry.bind("<KeyRelease>", apply_filter)
+
         def populate(rows):
             if not win.winfo_exists():
                 return
             go.config(state="normal")
-            info.config(fg=FG_DIM, text="No results." if not rows
-                        else "Click a result to fetch it:")
-            for r in rows:
-                rowf = tk.Frame(results, bg=BG_SECTION, padx=10, pady=6,
-                                highlightbackground=BORDER_COLOR,
-                                highlightthickness=1, cursor="hand2")
-                rowf.pack(fill="x", pady=2)
-                tk.Label(rowf, text=r["title"][:72], font=FONT_LABEL,
-                         bg=BG_SECTION, fg=FG_TEXT, anchor="w").pack(fill="x")
-                sub = "  ·  ".join(x for x in (r["uploader"], r["duration"]) if x)
-                tk.Label(rowf, text=sub, font=FONT_SMALL,
-                         bg=BG_SECTION, fg=FG_DIM, anchor="w").pack(fill="x")
-                for w in (rowf, *rowf.winfo_children()):
-                    w.bind("<Button-1>", lambda e, u=r["url"]: pick(u))
-                    w.bind("<Enter>", lambda e, f=rowf: set_row_bg(f, BG_INPUT))
-                    w.bind("<Leave>", lambda e, f=rowf: set_row_bg(f, BG_SECTION))
+            all_rows[:] = rows
+            if not rows:
+                info.config(text="No results.", fg=FG_DIM)
+                render([])
+                return
+            apply_filter()
 
         def fail(msg):
             if not win.winfo_exists():
@@ -1525,11 +1747,12 @@ class YTYoinkApp(tk.Tk):
             info.config(text="Searching...", fg=FG_DIM)
             for child in results.winfo_children():
                 child.destroy()
+            duration = None if dur_var.get() == "any" else dur_var.get()
 
             def worker():
                 try:
                     from downloader import search_youtube
-                    rows = search_youtube(query)
+                    rows = search_youtube(query, limit=100, duration=duration)
                     self.after(0, populate, rows)
                 except Exception as e:
                     self.after(0, fail, str(e))
@@ -1539,8 +1762,6 @@ class YTYoinkApp(tk.Tk):
         go = self._make_button(row, "Search", start, BG_BUTTON_ACCENT,
                                FG_BUTTON_ACCENT, BG_BUTTON_ACCENT_HOVER)
         go.pack(side="right")
-        info.pack(fill="x", pady=(8, 2))
-        results.pack(fill="both", expand=True)
         field.entry.bind("<Return>", lambda e: start())
         field.entry.focus_set()
 
@@ -1897,32 +2118,18 @@ class YTYoinkApp(tk.Tk):
                      bg=BG_MAIN, fg=FG_DIM).pack(pady=20, padx=40)
             return
 
-        tk.Label(body, text="Click a download to show it in Explorer:",
-                 font=FONT_SMALL, bg=BG_MAIN, fg=FG_DIM,
-                 anchor="w").pack(fill="x", pady=(0, 4))
         wrap, inner = self._scroll_area(
             body, height=min(360, 34 * len(entries) + 10))
         wrap.pack(fill="both", expand=True)
 
-        def set_row_bg(frame, color):
-            frame.config(bg=color)
-            for child in frame.winfo_children():
-                child.config(bg=color)
-
         for e in entries:
-            rowf = tk.Frame(inner, bg=BG_SECTION, padx=10, pady=5,
-                            cursor="hand2")
+            rowf = tk.Frame(inner, bg=BG_SECTION, padx=10, pady=5)
             rowf.pack(fill="x", pady=1)
             tk.Label(rowf, text=e.get("ts", ""), font=FONT_SMALL,
                      bg=BG_SECTION, fg=FG_DIM).pack(side="right")
             tk.Label(rowf, text=e.get("file", "?")[:64], font=FONT_SMALL,
                      bg=BG_SECTION, fg=FG_TEXT, anchor="w").pack(
                 side="left", fill="x", expand=True)
-            for w in (rowf, *rowf.winfo_children()):
-                w.bind("<Button-1>",
-                       lambda ev, p=e.get("path", ""): self._reveal_file(p))
-                w.bind("<Enter>", lambda ev, f=rowf: set_row_bg(f, BG_INPUT))
-                w.bind("<Leave>", lambda ev, f=rowf: set_row_bg(f, BG_SECTION))
 
     # ---- Playlist picker + queue ----
 

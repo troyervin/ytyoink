@@ -252,6 +252,33 @@ class CheckboxEntry(tk.Frame):
             self._entry.config(state="disabled", fg=FG_DIM)
 
 
+def monitor_bounds(widget):
+    """Work area of the monitor containing a widget. winfo_screen* only
+    covers the primary monitor, which puts popups on the wrong screen
+    for multi-monitor setups."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD),
+                        ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT),
+                        ("dwFlags", wintypes.DWORD)]
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(widget.winfo_toplevel().winfo_id())
+        monitor = user32.MonitorFromWindow(hwnd, 2)  # nearest monitor
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if user32.GetMonitorInfoW(monitor, ctypes.byref(mi)):
+            rw = mi.rcWork
+            return rw.left, rw.top, rw.right, rw.bottom
+    except Exception:
+        pass
+    return 0, 0, widget.winfo_screenwidth(), widget.winfo_screenheight()
+
+
 class ImagePreview(tk.Frame):
     """Displays a rounded-corner image preview with a label underneath."""
 
@@ -396,30 +423,7 @@ class ImagePreview(tk.Frame):
         self._zoom_job = self.after(350, self._show_zoom)
 
     def _monitor_bounds(self):
-        """Work area of the monitor containing this widget. winfo_screen*
-        only covers the primary monitor, which put the popup on the wrong
-        screen for multi-monitor setups."""
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            class MONITORINFO(ctypes.Structure):
-                _fields_ = [("cbSize", wintypes.DWORD),
-                            ("rcMonitor", wintypes.RECT),
-                            ("rcWork", wintypes.RECT),
-                            ("dwFlags", wintypes.DWORD)]
-
-            user32 = ctypes.windll.user32
-            hwnd = user32.GetParent(self.winfo_toplevel().winfo_id())
-            monitor = user32.MonitorFromWindow(hwnd, 2)  # nearest monitor
-            mi = MONITORINFO()
-            mi.cbSize = ctypes.sizeof(MONITORINFO)
-            if user32.GetMonitorInfoW(monitor, ctypes.byref(mi)):
-                rw = mi.rcWork
-                return rw.left, rw.top, rw.right, rw.bottom
-        except Exception:
-            pass
-        return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
+        return monitor_bounds(self)
 
     def _pick_zoom_placement(self):
         """Choose popup size and position: above or below the tile (shrunk
